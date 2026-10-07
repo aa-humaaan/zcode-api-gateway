@@ -48,6 +48,8 @@
 > 1195 tests pass, typecheck clean; responses-hook + webhook verified live.
 > **Phase 1–3 of the plan are now fully built.**
 >
+> **NEXT UP (2026-10-07): §8 — Panel alongside the TUI.** Milestone committed
+> and pushed to the fork (d1cd9e6, upstream remote added).
 > **§7 Usage Dashboard LANDED (2026-10-07)** — control command `{"cmd":"usage","days"}`
 > (clamped 1-365), ledger read-cache (stat-based, append-invalidated), panel
 > **Usage card** (window switcher 1d/7d/30d persisted, by-day bars, 2×2
@@ -394,7 +396,114 @@ auth surface — strictly additive to the panel and the control protocol.
 
 ---
 
-## 8. Decision points (where I want your tweaks)
+## 8. Feature plan — Panel alongside the TUI (+ `panel:` in config.yaml)
+
+> Status: PLANNED (2026-10-07) — the next build after the §7 dashboard.
+> Motivation (live, 2026-10-07): the operator launched the TUI, opened
+> `127.0.0.1:8090` on a phone and got ERR_CONNECTION_REFUSED — the panel is
+> serve-mode-only today, so the dashboard requires giving up the TUI.
+
+### 8.1 Goal
+
+One process, both surfaces: the **TUI on the desktop screen** and the **web
+panel on a phone**, showing the SAME state (proxy running/stopped, fleet,
+usage, logs) with no env-var-per-terminal-session dance. Plus `panel:` as a
+first-class config.yaml section so enabling the panel is a one-time setting.
+
+### 8.2 Part 1 — `panel:` config section (small)
+
+Today the panel resolves from env only (`ZCODE_PANEL_ENABLED` /
+`ZCODE_PANEL_TOKEN` / `ZCODE_PANEL_PORT` in server/panel.ts). Add YAML:
+
+```yaml
+panel:
+  enabled: true
+  token: "pick-a-long-secret"   # mandatory when enabled (unchanged contract)
+  port: 8090                    # loopback only (unchanged)
+```
+
+- `config/types.ts`: `PanelConfig { enabled: boolean; token?: string; port?: number }`;
+  `ProxyConfig.panel?` (loader always sets it, fixtures may omit).
+- `loader.ts`: `resolvePanelConfig` — env wins over YAML (existing convention).
+- `server/panel.ts`: `resolvePanelSettings(env)` gains an optional YAML input —
+  resolution order: env > yaml > default, the CONTRACT is unchanged: no
+  non-empty token, no panel (loud warn, never a silent unauthenticated panel).
+- Template + config.example.yaml: commented `panel:` block.
+- Works in BOTH modes from then on (serve behavior unchanged; TUI picks it up
+  in Part 2).
+
+### 8.3 Part 2 — TUI starts the panel when enabled (the bulk)
+
+The TUI already holds everything the serve panel needs (config, path, auth,
+`serverRef`). The work is bridging state, not building UI:
+
+1. **Export `startServePanel`** from index.ts (it is module-private today) and
+   make its ctx work for the TUI: same `config / path / auth / serverRef /
+   fleet / shutdown` shape.
+2. **Log tee bridge**: the TUI routes every console line into its `LogPane`
+   (log-pane.ts); the panel's Logs card reads a `LogBuffer` (control.ts).
+   The TUI's `emit()` pushes into BOTH — one extra call, zero duplication of
+   log content.
+3. **Single source of truth for the proxy state**: the panel's
+   `startProxy` / `stopProxy` / `setConfig` hooks call the TUI's own
+   lifecycle functions (which update `state.serverStatus` and render), so a
+   stop from the phone flips the desktop TUI card to `○ stopped` on the next
+   frame — and vice versa. The dispatcher's `controlState.proxyPort` is
+   updated by the same hooks.
+4. **`shutdown` from the panel routes through the TUI's `quit()`** (terminal
+   restore + clean exit), not the bare serve shutdown path.
+5. Panel lifecycle: started once alongside the TUI boot (after config load,
+   before the first render so the URL line lands in the logs); a failed panel
+   start warns and continues — the TUI must never die because the panel
+   could not bind (same rule as serve).
+
+### 8.4 Edge cases
+
+- **Token missing while enabled** → loud warn in the TUI logs, no panel (the
+  existing refuse-to-start contract, unchanged).
+- **Port already bound** (second gateway instance) → warn-and-continue, the
+  TUI keeps running.
+- **Panel stopProxy while a stream is in flight** → identical semantics to
+  the serve panel today (server stop closes in-flight streams) — the phone is
+  the operator, by definition.
+- **Serve mode** must remain byte-for-byte identical; Part 2 touches only the
+  TUI boot path.
+
+### 8.5 Security (unchanged)
+
+Loopback bind only; token mandatory and compared constant-time; the panel
+never exposes `/v1/*` credentials. YAML just moves WHERE the token lives, not
+whether it is required.
+
+### 8.6 Tests
+
+| Test | Asserts |
+|---|---|
+| loader: `panel:` section | YAML parse, env-over-YAML precedence, invalid values throw |
+| panel.ts: `resolvePanelSettings` with YAML input | enabled+token from YAML; env overrides; token missing → null (+ warn) in both modes |
+| control hooks | already covered by panel.test.ts (dispatcher is shared) |
+| TUI wiring | manual exit test (TTY) — no synthetic TUI harness; the wiring is 4 hook functions |
+
+### 8.7 Exit test
+
+Start the TUI (panel enabled in config.yaml), open the phone, and: the
+dashboard shows the proxy as running; press Stop on the phone; the desktop
+TUI card flips to `○ stopped` within one frame; press Start on the phone; the
+TUI flips back. Usage and Fleet on the phone reflect the same two real
+accounts.
+
+### 8.8 Effort & order
+
+| # | Piece | Size |
+|---|---|---|
+| 1 | `panel:` config section + loader + template + tests | S |
+| 2 | `startServePanel` export + hook-based ctx refactor | S |
+| 3 | TUI wiring: log tee bridge + lifecycle hooks + boot/shutdown | M |
+| 4 | Smoke + PLAN.md progress update | S |
+
+---
+
+## 9. Decision points (where I want your tweaks)
 
 1. **Name & identity.** Repo says `zcode-api-gateway`. Binary/package name,
    TUI branding — pick something ownable or keep this. (Needs deciding by
@@ -408,7 +517,7 @@ auth surface — strictly additive to the panel and the control protocol.
 5. **One thing I won't compromise on:** keeping single-account behavior
    perfect. It's the upgrade path for every existing user of the fork.
 
-## 9. Risks & honesty corner
+## 10. Risks & honesty corner
 
 - **Multi-account vs. vendor ToS.** Running several *own* accounts through one
   local client is a gray zone with any vendor. This stays a local tool for
@@ -422,7 +531,7 @@ auth surface — strictly additive to the panel and the control protocol.
   protocol-touching files (`oauth.ts`, `resolver.ts`, signing) get minimal
   changes so merges stay boring.
 
-## 10. Build order & rough effort
+## 11. Build order & rough effort
 
 | # | Deliverable | Size |
 |---|---|---|
