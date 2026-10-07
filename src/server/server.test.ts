@@ -8,6 +8,10 @@ import { handleListModels } from "./routes-openai.js";
 import { handleMessages } from "./routes-anthropic.js";
 import type { ProxyConfig } from "../config/types.js";
 import { AuthManager } from "../auth/manager.js";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { beforeEach, afterEach } from "bun:test";
 
 /** AuthManager with a preset oauth credential (replaces the removed apikey mode). */
 function oauthAuth(key = "testkey.testsecret"): AuthManager {
@@ -78,6 +82,20 @@ function mockUpstream(): typeof fetch {
     );
   }) as typeof fetch;
 }
+
+
+// Virtual-key store isolation: the auth gate consults the REAL api-keys.json
+// when no store dir override is set — a machine with virtual keys configured
+// would 401 every keyless test request here. Point the store at a temp dir.
+let keysStoreDir = "";
+beforeEach(() => {
+  keysStoreDir = mkdtempSync(join(tmpdir(), "srv-keys-test-"));
+  process.env.ZCODE_PROXY_STORE_DIR = keysStoreDir;
+});
+afterEach(() => {
+  delete process.env.ZCODE_PROXY_STORE_DIR;
+  rmSync(keysStoreDir, { recursive: true, force: true });
+});
 
 describe("server routing", () => {
   it("GET /v1/models returns model list", async () => {

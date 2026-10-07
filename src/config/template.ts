@@ -61,6 +61,33 @@ planAutoSwitch: false
 # Env override: ZCODE_PLAN_POLL_INTERVAL_SEC
 # planPollIntervalSec: 30
 
+# Fleet router (multi-account): log in several accounts (repeat \`auth login\`)
+# and the gateway routes around the ones that run dry. While off, the ACTIVE
+# account (first enabled in the accounts store) serves exactly as before.
+# Env overrides: ZCODE_ACCOUNTS_ENABLED / ZCODE_ACCOUNTS_STRATEGY /
+# ZCODE_ACCOUNTS_POLL_INTERVAL_SEC
+# accounts:
+#   enabled: true
+#   # How to pick the serving account while several still have quota:
+#   #   priority    — drain accounts in store order (accounts list), top-down
+#   #   round-robin — spread requests evenly across usable accounts
+#   #   least-used  — the account with the most remaining quota headroom
+#   strategy: priority
+#   # Fleet quota-probe cadence in seconds (probes are staggered per account
+#   # so the fleet never hammers the quota endpoints). Applies live.
+#   pollIntervalSec: 60
+#   # Pre-switch (0 = off): when an account projects empty within this many
+#   # minutes (burn-rate slope over recent probes), new traffic steers to the
+#   # next account BEFORE the hard 429. Try 10.
+#   preSwitchMinutes: 0
+
+# Local event notifications (both sinks opt-in; events deduped per kind).
+# Env overrides: ZCODE_NOTIFY_WEBHOOK / ZCODE_NOTIFY_NTFY
+# notifications:
+#   webhook: ""            # receives {service, event, message, ts} JSON POSTs
+#   ntfy: ""               # e.g. https://ntfy.sh/your-private-topic (phone push)
+#   cooldownSec: 300       # min seconds between repeats of the same event
+
 providers:
   zai:
     anthropicBase: "https://api.z.ai/api/anthropic"

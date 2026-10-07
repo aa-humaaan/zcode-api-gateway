@@ -526,3 +526,62 @@ describe("buildFrame", () => {
     }
   });
 });
+
+describe("buildFrame — Fleet card", () => {
+  const fleetState = {
+    strategy: "priority",
+    accounts: [
+      {
+        id: "id-1",
+        label: "work",
+        provider: "zai",
+        enabled: true,
+        serving: true,
+        isActive: true,
+        entries: [
+          { plan: "start-plan", state: "empty", remainingRatio: 0 },
+          { plan: "coding-plan", state: "usable", remainingRatio: 0.7 },
+        ],
+      },
+      {
+        id: "id-2",
+        label: "backup",
+        provider: "bigmodel",
+        enabled: false,
+        serving: false,
+        isActive: false,
+        entries: [
+          { plan: "start-plan", state: "unknown", remainingRatio: null },
+          { plan: "coding-plan", state: "unknown", remainingRatio: null },
+        ],
+      },
+    ],
+  } as const;
+
+  test("renders account rows with serving marker, chips and toggle buttons", () => {
+    const frame = buildFrame(baseState({ fleet: fleetState as unknown as FrameState["fleet"] }));
+    const text = frame.text.replace(/\x1b\[[0-9;]*m/g, "");
+    expect(text).toContain("Fleet (priority)");
+    expect(text).toContain("work ●");
+    expect(text).toContain("backup");
+    expect(text).toContain("trial✗ %0");
+    expect(text).toContain("coding✓ %70");
+    expect(text).toContain("[disable]");
+    expect(text).toContain("[enable]");
+  });
+
+  test("toggle buttons register clickable account regions", () => {
+    const frame = buildFrame(baseState({ fleet: fleetState as unknown as FrameState["fleet"] }));
+    const accountRegions = frame.regions.filter((r) => r.action.kind === "account");
+    expect(accountRegions.length).toBe(2);
+    const ids = accountRegions.map((r) => (r.action as { accountId: string }).accountId).sort();
+    expect(ids).toEqual(["id-1", "id-2"]);
+  });
+
+  test("hidden with fewer than two accounts", () => {
+    const state = baseState({
+      fleet: { strategy: "priority", accounts: [fleetState.accounts[0] as unknown as import("../accounts/router.js").FleetSnapshotAccount] },
+    });
+    expect(plainLines(state).join("\n")).not.toContain("Fleet (priority)");
+  });
+});

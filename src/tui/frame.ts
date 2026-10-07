@@ -20,7 +20,8 @@ export type ClickAction =
   | { kind: "key"; key: string }
   | { kind: "provider"; value: "zai" | "bigmodel" }
   | { kind: "plan"; value: "coding-plan" | "start-plan" }
-  | { kind: "follow" };
+  | { kind: "follow" }
+  | { kind: "account"; accountId: string };
 
 /** 0-based terminal-cell span carrying an action. */
 export interface ClickRegion {
@@ -85,6 +86,13 @@ export interface QuotaState {
   fetchedAt: number;
 }
 
+/**
+ * Fleet (multi-account) card view-state — the `accounts/router.ts` snapshot
+ * verbatim (type-only import; the frame stays pure). Rendered when two or
+ * more accounts exist and the terminal has room.
+ */
+export type FleetState = import("../accounts/router.js").FleetSnapshot;
+
 export interface FrameState {
   version: string;
   configPath: string;
@@ -101,6 +109,8 @@ export interface FrameState {
   responsesEnabled: boolean;
   claimAuto: boolean;
   quota: QuotaState | null;
+  /** Fleet snapshot (≥2 accounts); null/absent hides the Fleet card. */
+  fleet?: FleetState | null;
   logTotal: number;
   logView: ReadonlyArray<{ level: string; text: string }>;
   logFollowing: boolean;
@@ -548,6 +558,58 @@ export function buildFrame(s: FrameState): Frame {
     ]);
     emit(refreshRow.line);
     regions.push(...refreshRow.regions);
+    emit(renderBottomBorder(w));
+    emit("");
+  }
+
+  // --- Fleet card (multi-account; shown from 2 accounts when there's room) -
+  // Rows: ● serving · label · provider · per-plan state chips · [toggle].
+  // Chip marks: ✓ usable · ✗ empty · ⏳ cooling down · · unknown (no probe
+  // data yet — the router still serves those entries, fail-open).
+  const MAX_FLEET_ROWS = 5;
+  const fleetAccounts = s.fleet?.accounts ?? [];
+  const fleetRows = Math.min(MAX_FLEET_ROWS, fleetAccounts.length, h - 26);
+  if (fleetAccounts.length >= 2 && fleetRows >= 1) {
+    const strategy = s.fleet!.strategy;
+    emit(renderTopBorder(w, [{ t: "Fleet", c: BOLD }, { t: ` (${strategy})`, c: DIM }], [{ t: `${fleetAccounts.length} accounts`, c: DIM }]));
+
+    const entryMark = (state: string): string =>
+      state === "usable" ? "✓" : state === "empty" ? "✗" : state === "cooldown" ? "⏳" : "·";
+    const entryColor = (state: string): string =>
+      state === "usable" ? GREEN : state === "empty" ? RED : state === "cooldown" ? AMBER : DIM;
+    const planShort = (plan: string): string => (plan === "start-plan" ? "trial" : "coding");
+
+    for (const account of fleetAccounts.slice(0, fleetRows)) {
+      const chips: Seg[] = [];
+      for (const entry of account.entries) {
+        const pct = entry.remainingRatio !== null ? ` %${Math.round(entry.remainingRatio * 100)}` : "";
+        chips.push({ t: "  " });
+        chips.push({ t: `${planShort(entry.plan)}${entryMark(entry.state)}${pct}`, c: entryColor(entry.state) });
+      }
+      const nameSeg: Seg = account.serving
+        ? { t: `${account.label} ●`, c: GREEN }
+        : account.enabled
+          ? { t: account.label, c: CYAN }
+          : { t: account.label, c: DIM };
+      const toggleParts: Part[] = [
+        { t: padName(truncateToWidth(nameSeg.t, 12)), c: nameSeg.c },
+        { t: ` ${truncateToWidth(account.provider, 8)}`, c: DIM },
+        ...chips,
+        { t: "  " },
+        {
+          t: account.enabled ? " [disable] " : " [enable] ",
+          c: account.enabled ? BTN_GRAY : BTN_GREEN,
+          action: { kind: "account", accountId: account.id },
+        },
+        ...(account.isActive ? [{ t: " active" as string, c: DIM }] : []),
+      ];
+      const row = composeRow(w, lines.length, "Accounts", toggleParts);
+      emit(row.line);
+      regions.push(...row.regions);
+    }
+    if (fleetAccounts.length > fleetRows) {
+      emit((composeRow(w, lines.length, "", [{ t: `  +${fleetAccounts.length - fleetRows} more (zcode-proxy accounts list)`, c: DIM }])).line);
+    }
     emit(renderBottomBorder(w));
     emit("");
   }

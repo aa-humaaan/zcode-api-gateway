@@ -82,8 +82,19 @@
       #token { width: 260px; }
       .muted { color: var(--muted); }
       .danger { color: var(--danger); }
+      .warn { color: var(--warn); }
+      .ok { color: var(--ok); }
       .bar { height: 8px; border-radius: 4px; background: var(--border); overflow: hidden; margin: 4px 0; }
       .bar > i { display: block; height: 100%; background: var(--accent); }
+      button.active { border-color: var(--accent); color: var(--accent); }
+      .mini { display: inline-block; height: 6px; width: 56px; border-radius: 3px; background: var(--border); overflow: hidden; vertical-align: middle; }
+      .mini > i { display: block; height: 100%; background: var(--accent); }
+      .usage-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 18px; margin-top: 6px; }
+      .usage-grid h3 { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 0 0 4px; }
+      .usage-grid .urow { display: flex; align-items: center; gap: 6px; font-size: 13px; }
+      .usage-grid .urow .name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .usage-grid .urow .num { margin-left: auto; white-space: nowrap; }
+      @media (max-width: 600px) { .usage-grid { grid-template-columns: 1fr; } }
       #logs {
         margin: 0;
         max-height: 260px;
@@ -171,6 +182,24 @@
           <button id="logout">Logout</button>
         </div>
         <div id="login-body" class="row muted"></div>
+      </section>
+
+      <section>
+        <h2>Fleet <span class="muted">(multi-account — order = serving priority)</span></h2>
+        <div id="fleet-body" class="muted">No data yet.</div>
+        <div class="row muted">Enable/disable applies live; ◉ marks the account requests are served from.</div>
+      </section>
+
+      <section>
+        <h2>Usage <span class="muted">(local ledger — no upstream calls)</span></h2>
+        <div class="row">
+          <button id="usage-1" class="usage-win">1d</button>
+          <button id="usage-7" class="usage-win">7d</button>
+          <button id="usage-30" class="usage-win">30d</button>
+          <button id="usage-refresh">Refresh</button>
+          <span id="usage-age" class="muted"></span>
+        </div>
+        <div id="usage-body" class="muted">No data yet.</div>
       </section>
 
       <section>
@@ -346,6 +375,124 @@
         if (stick) box.scrollTop = box.scrollHeight;
       }
 
+      // Fleet card: pure snapshot (store + router state, no upstream calls), so
+      // unlike quota it is safe to poll on the fast timer.
+      const FLEET_MARK = { usable: "✓", empty: "✗", cooldown: "⏳", unknown: "·" };
+      const FLEET_CLASS = { usable: "ok", empty: "danger", cooldown: "warn", unknown: "muted" };
+      const FLEET_PLAN = { "start-plan": "trial", "coding-plan": "coding" };
+      function renderFleet(fleet) {
+        const parts = [];
+        for (const account of fleet.accounts || []) {
+          const name = account.serving ? "◉ " : account.isActive ? "· " : "&nbsp;&nbsp;";
+          const chips = (account.entries || [])
+            .map((e) => {
+              const pct = e.remainingRatio !== null && e.remainingRatio !== undefined
+                ? " %" + Math.round(e.remainingRatio * 100)
+                : "";
+              return '<span class="' + FLEET_CLASS[e.state] + '">' + esc(FLEET_PLAN[e.plan] || e.plan) +
+                esc(FLEET_MARK[e.state] || "·") + esc(pct) + "</span>";
+            })
+            .join(" ");
+          const toggle = '<button data-account="' + esc(account.id) + '" data-op="' +
+            (account.enabled ? "disable" : "enable") + '">' + (account.enabled ? "Disable" : "Enable") + "</button>";
+          parts.push(
+            '<div class="row"><strong>' + name + esc(account.label) + "</strong>" +
+            ' <span class="muted">' + esc(account.provider) + "</span> " + chips + " " + toggle +
+            (account.enabled ? "" : ' <span class="warn">disabled</span>') + "</div>",
+          );
+        }
+        if ((fleet.accounts || []).length === 0) {
+          parts.push("No accounts. Use Login above to add the first one.");
+        }
+        $("fleet-body").innerHTML = parts.join("") || "No data yet.";
+        for (const btn of $("fleet-body").querySelectorAll("button[data-account]")) {
+          btn.onclick = () => guard("account", { cmd: "accountsMutate", op: btn.dataset.op, ref: btn.dataset.account });
+        }
+      }
+
+      async function loadFleet() {
+        if (!token) return;
+        const r = await cmd({ cmd: "accounts" });
+        if (r.ok && r.fleet) renderFleet(r.fleet);
+        else if (!r.ok) $("fleet-body").innerHTML = '<div class="danger">' + esc(r.error || "failed") + "</div>";
+      }
+
+      // ── Usage card (PLAN §7): local ledger aggregates, polled every 30s —
+      // a local file read, cheap; unlike quota it is safe on a timer.
+      let usageDays = parseInt(localStorage.getItem("zcode.panel.usageDays") || "7", 10);
+      if (![1, 7, 30].includes(usageDays)) usageDays = 7;
+      function fmtCompact(n) {
+        if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
+        if (n >= 1e3) return (n / 1e3).toFixed(1) + "K";
+        return String(n);
+      }
+      function renderUsage(u) {
+        const body = $("usage-body");
+        if (!u || u.totalRequests === 0) {
+          body.innerHTML = "No usage recorded yet — serve some requests first.";
+          return;
+        }
+        const parts = [];
+        parts.push(
+          '<div class="row"><strong>' + u.totalRequests.toLocaleString() + "</strong> requests · <strong>" +
+          fmtCompact(u.totalTokens) + "</strong> tokens" +
+          (u.failedRequests > 0 ? ' · <span class="danger">' + u.failedRequests + " failed</span>" : "") + "</div>",
+        );
+        // By-day bars: width relative to the busiest day (requests), tokens as text.
+        const maxDay = Math.max(1, ...(u.byDay || []).map((d) => d.requests));
+        parts.push('<div class="muted" style="margin-top:8px">By day</div>');
+        for (const d of u.byDay || []) {
+          const w = ((d.requests / maxDay) * 100).toFixed(1);
+          parts.push(
+            '<div class="row"><span class="muted">' + esc(d.name) + '</span>' +
+            '<span class="bar" style="flex:1;margin:0"><i style="width:' + w + '%"></i></span>' +
+            "<strong>" + d.requests + " req · " + fmtCompact(d.tokens) + " tok</strong></div>",
+          );
+        }
+        const block = (title, rows) => {
+          const max = Math.max(1, ...rows.map((r) => r.requests));
+          return "<h3>" + esc(title) + "</h3>" + rows.slice(0, 6).map((r) => {
+            const w = ((r.requests / max) * 100).toFixed(1);
+            return '<div class="urow"><span class="name">' + esc(r.name) + '</span>' +
+              '<span class="mini"><i style="width:' + w + '%"></i></span>' +
+              '<span class="num"><strong>' + r.requests + "</strong> · " + fmtCompact(r.tokens) + " tok</span></div>";
+          }).join("") + (rows.length > 6 ? '<div class="muted">+' + (rows.length - 6) + " more (zcode-proxy usage)</div>" : "");
+        };
+        parts.push('<div class="usage-grid">');
+        parts.push("<div>" + block("By tool", u.byTool || []) + "</div>");
+        parts.push("<div>" + block("By model", u.byModel || []) + "</div>");
+        parts.push("<div>" + block("By account", u.byAccount || []) + "</div>");
+        parts.push("<div>" + block("By key", u.byKey || []) + "</div>");
+        parts.push("</div>");
+        body.innerHTML = parts.join("");
+        body.classList.remove("muted");
+      }
+      async function loadUsage() {
+        if (!token) return;
+        const r = await cmd({ cmd: "usage", days: usageDays });
+        if (r.ok && r.usage) {
+          renderUsage(r.usage);
+          $("usage-age").textContent = "updated " + new Date().toLocaleTimeString();
+        } else if (!r.ok) {
+          $("usage-age").textContent = "";
+          $("usage-body").innerHTML = '<div class="danger">' + esc(r.error || "failed") + "</div>";
+        }
+      }
+      function markUsageWindow() {
+        for (const btn of document.querySelectorAll("button.usage-win")) {
+          btn.classList.toggle("active", Number(btn.id.replace("usage-", "")) === usageDays);
+        }
+      }
+      for (const btn of document.querySelectorAll("button.usage-win")) {
+        btn.onclick = () => {
+          usageDays = Number(btn.id.replace("usage-", ""));
+          localStorage.setItem("zcode.panel.usageDays", String(usageDays));
+          markUsageWindow();
+          loadUsage();
+        };
+      }
+      $("usage-refresh").onclick = () => loadUsage();
+
       async function startLogin(provider) {
         if (!token) return;
         $("login-body").innerHTML = '<span class="muted">requesting authorize URL…</span>';
@@ -402,11 +549,16 @@
         $("token").value = token;
         refreshStatus();
         loadQuota();
+        loadFleet();
+        markUsageWindow();
+        loadUsage();
       } else {
         setConn("bad", "enter token to connect");
       }
       setInterval(refreshStatus, 5000);
       setInterval(pollLogs, 2000);
+      setInterval(loadFleet, 5000);
+      setInterval(loadUsage, 30000);
       // No quota polling timer on purpose: the billing gateway rate-limits
       // frequent queries (same reason the TUI refreshes on keypress only).
     </script>

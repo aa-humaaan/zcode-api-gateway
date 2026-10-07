@@ -34,6 +34,10 @@ export interface ConfigWatchHandles {
   planWatcherRunning(): boolean;
   startPlanWatcher(): void;
   stopPlanWatcher(): void;
+  /** Fleet router (multi-account failover) lifecycle. */
+  fleetRunning(): boolean;
+  startFleet(): void;
+  stopFleet(): void;
   /** Warm the captcha pool when the config moves to start-plan (no-op once up). */
   warmCaptchaPool(): void;
 }
@@ -106,6 +110,7 @@ export function watchConfigFile(
 function reconcileJobs(handles: ConfigWatchHandles, config: ProxyConfig, changed: Set<string>): void {
   reconcileClaimJobs(handles, config, changed);
   reconcilePlanWatcherJobs(handles, config, changed);
+  reconcileFleetJobs(handles, config, changed);
 
   if (config.plan === "start-plan") handles.warmCaptchaPool();
 }
@@ -117,12 +122,26 @@ function reconcileClaimJobs(handles: ConfigWatchHandles, config: ProxyConfig, ch
 function reconcilePlanWatcherJobs(handles: ConfigWatchHandles, config: ProxyConfig, changed: Set<string>): void {
   // A dirty poll interval restarts the watcher even when it keeps running,
   // so the new cadence reaches the running timer (claim-block pattern).
+  // Fleet mode subsumes the plan auto-switch — the watcher stays off while
+  // the fleet router owns the (account × plan) chain.
   reconcileToggleJob(
-    config.planAutoSwitch === true,
+    config.planAutoSwitch === true && config.accounts?.enabled !== true,
     changed.has("planAutoSwitch") || changed.has("planPollIntervalSec"),
     handles.planWatcherRunning(),
     handles.startPlanWatcher,
     handles.stopPlanWatcher,
+  );
+}
+
+function reconcileFleetJobs(handles: ConfigWatchHandles, config: ProxyConfig, changed: Set<string>): void {
+  // A dirty accounts block restarts the watcher so strategy / poll-interval
+  // changes reach the running job (claim-block pattern).
+  reconcileToggleJob(
+    config.accounts?.enabled === true,
+    changed.has("accounts"),
+    handles.fleetRunning(),
+    handles.startFleet,
+    handles.stopFleet,
   );
 }
 

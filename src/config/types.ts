@@ -204,6 +204,46 @@ export interface ClientSigningConfig {
 /** Upstream plan tiers the routing and auto-switch move between. */
 export type PlanTier = "coding-plan" | "start-plan";
 
+/**
+ * Fleet (multi-account) selection strategy — how the router picks the serving
+ * account when several enabled accounts still have quota.
+ */
+export type AccountStrategy = "priority" | "round-robin" | "least-used";
+
+/**
+ * Fleet router configuration (`accounts:` section). With `enabled: false`
+ * (default) the proxy serves with the ACTIVE account exactly as before —
+ * the fleet router, its watcher and the chain failover stay off.
+ */
+export interface AccountsConfig {
+  /** Enable the fleet router: strategy-based serving + (account, plan) chain failover. Default `false`. */
+  enabled: boolean;
+  /** Selection strategy across usable accounts. Default `"priority"` (drain in store order). */
+  strategy: AccountStrategy;
+  /** Fleet quota-probe cadence in seconds (staggered per account). Default `60`. */
+  pollIntervalSec: number;
+  /**
+   * Pre-switch: when the serving account's remaining share projects to run
+   * out within this many minutes (probe slope + burn history), the router
+   * starts preferring the NEXT account for new requests instead of riding
+   * the current one into a 429. `0` (default) = off — pure reactive failover.
+   */
+  preSwitchMinutes?: number;
+}
+
+/**
+ * Local event notifications (`notifications:` section). Both sinks are
+ * opt-in; events are deduped per kind within `cooldownSec`.
+ */
+export interface NotificationsConfig {
+  /** Generic webhook URL — receives `{service, event, message, ts}` JSON. Empty = off. */
+  webhook?: string;
+  /** ntfy topic URL (e.g. https://ntfy.sh/my-topic) — message as POST body. Empty = off. */
+  ntfy?: string;
+  /** Minimum seconds between repeats of the same event. Default `300`. */
+  cooldownSec?: number;
+}
+
 /** Preference order used when the config carries none (today's behavior). */
 export const DEFAULT_PLAN_PRIORITY: PlanTier[] = ["start-plan", "coding-plan"];
 
@@ -299,6 +339,16 @@ export interface ProxyConfig {
   async: AsyncConfig;
   /** Manual claim ("weekend plan") configuration. */
   claim: ClaimConfig;
+  /**
+   * Fleet router (multi-account failover) configuration. `loadConfig` always
+   * sets it; fixtures may omit it (treated as disabled everywhere).
+   */
+  accounts?: AccountsConfig;
+  /**
+   * Local event notifications. `loadConfig` always sets it; fixtures may
+   * omit it (no sinks configured — notifications off).
+   */
+  notifications?: NotificationsConfig;
   logging: {
     level: "debug" | "info" | "warn" | "error";
   };

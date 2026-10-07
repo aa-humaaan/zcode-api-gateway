@@ -18,6 +18,8 @@ import {
 import { KeyResolver } from "./auth/resolver.js";
 import { saveCredential, clearCredential, loadCredential } from "./auth/store.js";
 import type { QuotaSnapshot } from "./server/routes-quota.js";
+import type { FleetSnapshot } from "./accounts/router.js";
+import type { UsageSummary } from "./ledger/ledger.js";
 
 /** Supported plan tiers. Mirrors `ProxyConfig.plan`. */
 export type PlanTier = "coding-plan" | "start-plan";
@@ -33,6 +35,9 @@ export type ControlCommand =
   | { cmd: "stopProxy" }
   | { cmd: "getLogs"; since?: number }
   | { cmd: "quota" }
+  | { cmd: "accounts" }
+  | { cmd: "accountsMutate"; op: "enable" | "disable"; ref: string }
+  | { cmd: "usage"; days?: number }
   | { cmd: "shutdown" };
 
 /** Successful response envelope. */
@@ -46,6 +51,9 @@ export type ControlOk =
   | { ok: true; event: "proxyStopped" }
   | { ok: true; event: "logs"; nextSince: number; lines: string[] }
   | { ok: true; event: "quota"; quota: QuotaSnapshot }
+  | { ok: true; event: "accounts"; fleet: FleetSnapshot }
+  | { ok: true; event: "accountUpdated"; op: "enable" | "disable"; ref: string }
+  | { ok: true; event: "usage"; usage: UsageSummary }
   | { ok: true; event: "shuttingDown" };
 
 /** Failure response envelope. */
@@ -125,6 +133,12 @@ export interface HandlerContext {
   onSetConfig?: (changes: { provider?: ProviderId; plan?: PlanTier }) => Promise<ConfigUpdateResult>;
   onShutdown?: () => Promise<void> | void;
   onQuota?: () => Promise<QuotaSnapshot>;
+  /** Fleet status for the Accounts card (pure snapshot; no upstream calls). */
+  onAccounts?: () => Promise<FleetSnapshot>;
+  /** Enable/disable one account by label or id (fleet manager). */
+  onAccountsMutate?: (op: "enable" | "disable", ref: string) => Promise<{ ok: true } | { ok: false; error: string }>;
+  /** Local usage aggregates for the panel's Usage card (pure file read). */
+  onUsage?: (days: number) => Promise<UsageSummary>;
   logBuffer: LogBuffer;
   /** Overrides login-client construction (tests inject offline clients). */
   createLoginClient?: (provider: ProviderId) => OAuthFlowClient;
@@ -280,6 +294,38 @@ async function dispatch(
       try {
         const quota = await ctx.onQuota();
         return { ok: true, event: "quota", quota };
+      } catch (err) {
+        return { ok: false, error: (err as Error).message };
+      }
+    }
+
+    case "accounts": {
+      // Pure snapshot (router matrix + store list) — no upstream calls, so the
+      // page can poll it freely, unlike `quota`.
+      if (!ctx.onAccounts) return { ok: false, error: "accounts_unavailable" };
+      try {
+        const fleet = await ctx.onAccounts();
+        return { ok: true, event: "accounts", fleet };
+      } catch (err) {
+        return { ok: false, error: (err as Error).message };
+      }
+    }
+
+    case "accountsMutate": {
+      if (!ctx.onAccountsMutate) return { ok: false, error: "accounts_unavailable" };
+      const result = await ctx.onAccountsMutate(cmd.op, cmd.ref);
+      if (!result.ok) return result;
+      return { ok: true, event: "accountUpdated", op: cmd.op, ref: cmd.ref };
+    }
+
+    case "usage": {
+      // Local ledger aggregates — no upstream calls, safe to poll. Days clamp
+      // to the same 1..365 window GET /usage serves.
+      if (!ctx.onUsage) return { ok: false, error: "usage_unavailable" };
+      const days = Math.min(365, Math.max(1, Math.floor(cmd.days ?? 7)));
+      try {
+        const usage = await ctx.onUsage(days);
+        return { ok: true, event: "usage", usage };
       } catch (err) {
         return { ok: false, error: (err as Error).message };
       }

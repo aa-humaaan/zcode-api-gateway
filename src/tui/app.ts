@@ -26,6 +26,9 @@ import { ensureDeviceMidInConfig, VERSION, createServeJobs, type ServeArgs } fro
 import { watchConfigFile, type ConfigWatcher } from "../config/watch.js";
 import { collectQuotaSnapshot, type QuotaSnapshot } from "../server/routes-quota.js";
 import { activePlan } from "../plan/auto.js";
+import { createFleetRouter, fleetSnapshot, syncFleet, type FleetRouter, type FleetSnapshot } from "../accounts/router.js";
+import { setAccountEnabled, loadAccounts } from "../accounts/store.js";
+import { configureNotify } from "../notify/notify.js";
 import { appendFileSync } from "node:fs";
 import type { ProxyConfig } from "../config/types.js";
 import type { ProviderId } from "../provider/types.js";
@@ -62,6 +65,7 @@ export async function runTui(args: ServeArgs): Promise<void> {
     process.stderr.write(`zcode-proxy: config error: ${(err as Error).message}\n`);
     process.exit(1);
   }
+  configureNotify(config);
 
   const auth = new AuthManager();
   const pane = new LogPane(2000);
@@ -78,6 +82,7 @@ export async function runTui(args: ServeArgs): Promise<void> {
     loginInFlight: false,
     loginHint: "",
     quota: null as QuotaState | null,
+    fleet: null as FleetSnapshot | null,
     toast: null as { text: string; kind: "ok" | "err" | "info" } | null,
   };
 
@@ -201,6 +206,7 @@ export async function runTui(args: ServeArgs): Promise<void> {
         responsesEnabled: config.responses.enabled,
         claimAuto: config.claim.enabled && config.claim.auto,
         quota: state.quota,
+        fleet: state.fleet,
         logTotal: view.total,
         logView: view.lines,
         logFollowing: pane.following,
@@ -325,6 +331,34 @@ export async function runTui(args: ServeArgs): Promise<void> {
     }
   }
 
+  // --- fleet (multi-account card; pure local state + store read — no upstream
+  // calls, safe to refresh on a timer) ---------------------------------------
+  async function refreshFleet(): Promise<void> {
+    try {
+      // Re-sync the router's snapshot from the store first so the card shows
+      // accounts even before the fleet watcher's first probe lands.
+      syncFleet(await loadAccounts());
+      state.fleet = fleetSnapshot(config);
+    } catch {
+      state.fleet = null;
+    }
+    scheduleRender();
+  }
+
+  /** Enable/disable toggle from the Fleet card rows (per-row buttons). */
+  async function toggleAccount(accountId: string): Promise<void> {
+    const account = state.fleet?.accounts.find((a) => a.id === accountId);
+    if (!account) return;
+    const next = !account.enabled;
+    const result = await setAccountEnabled(accountId, next);
+    if (result.ok) {
+      setToast(`account "${account.label}" ${next ? "enabled" : "disabled (serving skipped)"}`, "ok");
+    } else {
+      setToast(`account toggle failed: ${result.error ?? "unknown"}`, "err");
+    }
+    await refreshFleet();
+  }
+
   // --- proxy lifecycle ------------------------------------------------------
   async function startProxy(): Promise<void> {
     if (state.serverStatus === "running" || state.serverStatus === "starting") return;
@@ -339,7 +373,12 @@ export async function runTui(args: ServeArgs): Promise<void> {
     }
     auth.setOAuthCredential(cred);
     try {
-      const s = await startServer(buildServerOptions(config, auth, args.debug));
+      // Fleet router re-resolved per start: hot-reload may have flipped
+      // accounts.enabled since boot (stop/start applies it; hot-reload alone
+      // cannot mutate an already-running server's options).
+      const fleet = currentFleet();
+      if (fleet) await fleet.sync();
+      const s = await startServer(buildServerOptions(config, auth, args.debug, fleet ?? undefined));
       serverRef.current = s;
       state.serverStatus = "running";
       state.serverUrl = `http://${s.hostname}:${s.port}`;
@@ -375,7 +414,16 @@ export async function runTui(args: ServeArgs): Promise<void> {
   // Captcha warmup + claim scheduler start once per process, even across
   // proxy stop/start cycles — the pools and scheduler are process-global.
   let backgroundJobsStarted = false;
-  const jobs = createServeJobs(config, auth);
+  // Fleet router (accounts.enabled): created lazily and shared by the server
+  // options and the serve jobs (the jobs layer creates its own only when this
+  // still returned null at creation time — e.g. hot-reload-enabled fleets).
+  let fleetRouter: FleetRouter | null = null;
+  const currentFleet = (): FleetRouter | null => {
+    if (!config.accounts?.enabled) return null;
+    if (!fleetRouter) fleetRouter = createFleetRouter(config);
+    return fleetRouter;
+  };
+  const jobs = createServeJobs(config, auth, {}, currentFleet());
   let configWatcher: ConfigWatcher | null = null;
 
   function startBackgroundJobsOnce(): void {
@@ -609,7 +657,7 @@ export async function runTui(args: ServeArgs): Promise<void> {
           case "s": toggleProxy(); return;
           case "l": void startLogin(); return;
           case "o": void logout(); return;
-          case "r": void refreshQuota(); return;
+          case "r": void refreshQuota(); void refreshFleet(); return;
           case "u": void runUpdateCheck(true); return;
           case "p": switchProvider(); return;
           case "t": switchPlan(); return;
@@ -645,6 +693,9 @@ export async function runTui(args: ServeArgs): Promise<void> {
       case "follow":
         pane.followBottom();
         scheduleRender();
+        return;
+      case "account":
+        void toggleAccount(action.accountId);
         return;
     }
   }
@@ -698,6 +749,11 @@ export async function runTui(args: ServeArgs): Promise<void> {
   console.log(`provider: ${state.provider} · plan: ${state.plan}`);
   void runUpdateCheck();
   await refreshAuth();
+  void refreshFleet();
+  // Fleet card refresh: local store + router state only — no upstream quota
+  // calls on this timer (the fleet watcher owns those).
+  const fleetTimer = setInterval(() => { void refreshFleet(); }, 15000);
+  if (typeof fleetTimer.unref === "function") fleetTimer.unref();
   renderNow();
   if (!state.loggedIn) {
     setToast("not logged in — press l to login", "err");

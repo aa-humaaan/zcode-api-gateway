@@ -21,10 +21,15 @@ import { handleMcpListingRoute, handleMcpRelayRoute, type McpRouteOptions } from
 import { handleQuota } from "./routes-quota.js";
 import { errorResponse } from "../proxy/handler.js";
 import type { ResponseStore } from "../responses/store.js";
+import type { FleetRouter } from "../accounts/router.js";
+import { hasAnyKeys, resolveRequestKey } from "../keys/keys.js";
+import { readUsageDays, summarizeUsage } from "../ledger/ledger.js";
 
 interface ServerOptions {
   config: ProxyConfig;
   auth: AuthManager;
+  /** Fleet router (multi-account failover) when `accounts.enabled` is on. */
+  fleet?: FleetRouter;
   /** Override fetch for testing. */
   fetchImpl?: typeof fetch;
   /** When true, enable per-request debug diagnostics in the proxy handler. */
@@ -46,12 +51,13 @@ export interface ProxyServer {
 /** Create a fetch-style handler that routes the request through the proxy. */
 export function createFetchHandler(opts: ServerOptions): (req: Request) => Promise<Response> {
   const { config, auth } = opts;
-  const proxyOpts = { config, auth, fetchImpl: opts.fetchImpl, debug: opts.debug === true };
+  const proxyOpts = { config, auth, fetchImpl: opts.fetchImpl, debug: opts.debug === true, ...(opts.fleet ? { fleet: opts.fleet } : {}) };
   const responsesOpts = {
     config,
     auth,
     fetchImpl: opts.fetchImpl,
     debug: opts.debug === true,
+    ...(opts.fleet ? { fleet: opts.fleet } : {}),
     ...(opts.responseStore ? { responseStore: opts.responseStore } : {}),
   };
   const asyncOpts = {
@@ -84,10 +90,30 @@ export function createFetchHandler(opts: ServerOptions): (req: Request) => Promi
       });
     }
 
-    if (config.auth.proxyApiKey) {
+    // --- Auth gate ---
+    // Three regimes (keys/keys.ts):
+    //  - nothing configured → open local use, unchanged;
+    //  - proxyApiKey set → the ADMIN key works everywhere, virtual keys too;
+    //  - virtual keys configured (proxyApiKey or not) → every request must
+    //    present the admin key OR a valid virtual key. Virtual keys additionally
+    //    carry per-day caps and model allowlists, evaluated per request in the
+    //    handlers (so refusals land in the request log with a reason).
+    {
       const authHeader = req.headers.get("authorization") ?? req.headers.get("x-api-key");
-      if (!authHeader || !checkProxyKey(authHeader, config.auth.proxyApiKey)) {
-        return errorResponse(401, "authentication_error", "Invalid or missing proxy API key");
+      const adminOk = config.auth.proxyApiKey !== undefined
+        && authHeader !== null
+        && checkProxyKey(authHeader, config.auth.proxyApiKey);
+      if (!adminOk && (config.auth.proxyApiKey !== undefined || hasAnyKeys())) {
+        const vkey = resolveRequestKey(req);
+        if (!vkey || vkey.disabled) {
+          return errorResponse(
+            401,
+            "authentication_error",
+            hasAnyKeys()
+              ? "Invalid or missing key — present the admin proxyApiKey or a virtual key (zcode-proxy keys list)"
+              : "Invalid or missing proxy API key",
+          );
+        }
       }
     }
 
@@ -105,6 +131,16 @@ export function createFetchHandler(opts: ServerOptions): (req: Request) => Promi
 
     if (path === "/quota" && method === "GET") {
       return handleQuota(config, opts.fetchImpl);
+    }
+
+    if (path === "/usage" && method === "GET") {
+      // Local usage ledger aggregates — no upstream calls. `?days=N` (default 7).
+      const daysParam = Number(new URL(req.url).searchParams.get("days"));
+      const days = Number.isInteger(daysParam) && daysParam >= 1 && daysParam <= 365 ? daysParam : 7;
+      return new Response(JSON.stringify(summarizeUsage(readUsageDays(days), days)), {
+        status: 200,
+        headers: { "content-type": "application/json; charset=utf-8" },
+      });
     }
 
     if (path === "/v1/messages" && method === "POST") {

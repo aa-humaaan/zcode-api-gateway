@@ -348,3 +348,58 @@ describe("panel ↔ control dispatcher wiring", () => {
     expect(body.proxyPort).toBe(0);
   });
 });
+
+describe("panel control — usage command (PLAN §7)", () => {
+  it("returns the summary from the onUsage hook, days clamped to 1..365", async () => {
+    const seenDays: number[] = [];
+    const state: ControlState = { provider: "zai", plan: "coding-plan", proxyPort: 0 };
+    const handleControl = createControlDispatcher(state, {
+      logBuffer: new LogBuffer(),
+      onUsage: async (days) => {
+        seenDays.push(days);
+        return {
+          days,
+          totalRequests: 3,
+          totalTokens: 1234,
+          byDay: [{ name: "2026-10-07", requests: 3, tokens: 1234 }],
+          byTool: [{ name: "opencode", requests: 3, tokens: 1234 }],
+          byAccount: [{ name: "zai", requests: 3, tokens: 1234 }],
+          byModel: [{ name: "glm-4.6", requests: 3, tokens: 1234 }],
+          byKey: [{ name: "opencode", requests: 3, tokens: 1234 }],
+          failedRequests: 0,
+        };
+      },
+    });
+    const panel = await startPanel(handleControl);
+
+    const res = await controlRequest(panel, {
+      headers: { authorization: `Bearer ${TOKEN}` },
+      body: JSON.stringify({ cmd: "usage", days: 7 }),
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { ok: boolean; event: string; usage: { days: number; totalRequests: number; byTool: Array<{ name: string }> } };
+    expect(body.ok).toBe(true);
+    expect(body.event).toBe("usage");
+    expect(body.usage.days).toBe(7);
+    expect(body.usage.totalRequests).toBe(3);
+    expect(body.usage.byTool[0]?.name).toBe("opencode");
+
+    // Clamp: 0 → 1, negative → 1, absurd → 365.
+    await controlRequest(panel, { headers: { authorization: `Bearer ${TOKEN}` }, body: JSON.stringify({ cmd: "usage", days: 0 }) });
+    await controlRequest(panel, { headers: { authorization: `Bearer ${TOKEN}` }, body: JSON.stringify({ cmd: "usage", days: -5 }) });
+    await controlRequest(panel, { headers: { authorization: `Bearer ${TOKEN}` }, body: JSON.stringify({ cmd: "usage", days: 99999 }) });
+    expect(seenDays.slice(1)).toEqual([1, 1, 365]);
+  });
+
+  it("missing onUsage hook answers usage_unavailable instead of crashing", async () => {
+    const state: ControlState = { provider: "zai", plan: "coding-plan", proxyPort: 0 };
+    const handleControl = createControlDispatcher(state, { logBuffer: new LogBuffer() });
+    const panel = await startPanel(handleControl);
+    const res = await controlRequest(panel, {
+      headers: { authorization: `Bearer ${TOKEN}` },
+      body: JSON.stringify({ cmd: "usage" }),
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: false, error: "usage_unavailable" });
+  });
+});

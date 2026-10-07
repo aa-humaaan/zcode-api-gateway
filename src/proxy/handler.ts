@@ -20,11 +20,14 @@ import { getProvider } from "../provider/providers.js";
 import { buildUpstreamHeaderPairs, buildUpstreamRequest, type UpstreamHeaderPair } from "./upstream.js";
 import { getDefaultEndpointRouting, type EndpointRoutingService } from "./endpoint-routing.js";
 import { getDefaultClientSigning, sendWithClientSigning, type ClientSigningManager } from "./client-signing.js";
-import { credentialString } from "../auth/types.js";
+import { credentialString, type Credential } from "../auth/types.js";
 import { sendOrderedUpstreamRequest, orderedAdvertisedCodings } from "./ordered-transport.js";
 import { transformRequestBody } from "./body-transformer.js";
 import { isCaptchaChallenged, retryOnCaptchaChallenge } from "./captcha-retry.js";
 import { activePlan, planPriorityOf, retryOnPlanExhausted, sniffStartPlanRejection, shouldFallbackPlan, type PlanTier } from "../plan/auto.js";
+import { pickServing, credentialOf, walkFleetChain, evaluateFleetResponse, fleetChain, type FleetRouter, type ChainEntry } from "../accounts/router.js";
+import { appendUsage } from "../ledger/ledger.js";
+import { resolveRequestKey, admitRequest } from "../keys/keys.js";
 import { clientTraceFields, type ClientSessionResult } from "./client-session.js";
 import { resolveSessionContext } from "./session-context.js";
 import { randomBytes } from "node:crypto";
@@ -68,6 +71,13 @@ export interface ProxyHandlerOptions {
   endpointRouting?: EndpointRoutingService | null;
   /** Override the process-wide client signing manager (for testing). `null` disables. */
   clientSigning?: ClientSigningManager | null;
+  /**
+   * Fleet router (multi-account failover). Present only when `accounts.enabled`
+   * is on at boot; when set, the serving credential/plan come from the fleet
+   * chain (strategy-aware pick + per-request walk) and the single-account
+   * plan auto-switch is subsumed by the fleet failover.
+   */
+  fleet?: FleetRouter;
 }
 
 /**
@@ -110,6 +120,29 @@ export async function proxyRequest(
   const meta = peekBody(body);
   Object.assign(meta, clientTraceFields(clientReq));
 
+  // Tool attribution + virtual-key admission. A presented zk- virtual key
+  // (already gate-checked in server.ts) carries per-day caps and a model
+  // allowlist; the admin proxyApiKey path resolves to null here and skips.
+  const userAgent = clientReq.headers.get("user-agent");
+  if (userAgent) meta.tool = truncateTool(userAgent);
+  const vkey = resolveRequestKey(clientReq);
+  if (vkey) {
+    // Attribute at presentation: even a cap-refused request lands in the
+    // ledger under the key that made it (cap counts then reflect attempts).
+    meta.keyId = vkey.id;
+    meta.keyLabel = vkey.label;
+    const admission = admitRequest(vkey, meta.model);
+    if (!admission.ok) {
+      const status = admission.status ?? 401;
+      printRow(reqId, format, meta, status, started, Date.now(), 0, 0, 0);
+      return errorResponse(
+        status,
+        status === 429 ? "key_cap_reached" : status === 403 ? "model_not_allowed" : "key_disabled",
+        admission.reason ?? "rejected by virtual key policy",
+      );
+    }
+  }
+
   if (dumpEnabled()) {
     dumpPhase(reqId, "client_in", {
       method: clientReq.method,
@@ -119,20 +152,56 @@ export async function proxyRequest(
     });
   }
 
+  // `provider` is per-serving-entry: the fleet may fail over to an account of
+  // ANOTHER provider mid-request, so it rebuilds with each target (fleet mode)
+  // and stays config-bound otherwise.
   const staticProvider = getProvider(config.provider);
-  const provider = {
+  let provider = {
     ...staticProvider,
     anthropicBaseURL: config.providers[config.provider].anthropicBase,
     openaiBaseURL: config.providers[config.provider].openaiBase,
   };
 
-  let cred;
-  try {
-    cred = await auth.getCredential();
-  } catch (err) {
-    if (debug) debugError(reqId, "credential_unavailable", (err as Error).message);
-    printRow(reqId, format, meta, 503, started, Date.now(), 0, 0, 0);
-    return errorResponse(503, "credential_unavailable", (err as Error).message);
+  // Fleet mode (accounts.enabled): the strategy-aware pick decides BOTH the
+  // serving account and its plan; the request rebuilds with the picked
+  // credential (and, for cross-provider fleets, the picked provider). Single
+  // account: config.provider + AuthManager exactly as before.
+  const fleet = opts.fleet;
+  let entry: ChainEntry | null = null;
+  let cred: Credential;
+  if (fleet) {
+    entry = pickServing(config);
+    if (!entry) {
+      // Distinguish "nothing logged in" (503) from "everything cooling down
+      // after rejections" (429, quota-empty semantics — the walk exhausted
+      // the fleet moments ago; the watcher/cooldown expiry will reopen).
+      const hasEnabled = fleetChain(config).length > 0;
+      const status = hasEnabled ? 429 : 503;
+      const message = hasEnabled
+        ? "every account/plan in the fleet is cooling down after rejections — retry shortly"
+        : "no enabled account in the fleet — run: zcode-proxy auth login <zai|bigmodel> (or enable one: zcode-proxy accounts enable <label>)";
+      printRow(reqId, format, meta, status, started, Date.now(), 0, 0, 0);
+      return errorResponse(status, hasEnabled ? "fleet_quota_exhausted" : "credential_unavailable", message);
+    }
+    const picked = credentialOf(entry);
+    if (!picked) {
+      printRow(reqId, format, meta, 503, started, Date.now(), 0, 0, 0);
+      return errorResponse(503, "credential_unavailable", `fleet account "${entry.label}" disappeared mid-pick`);
+    }
+    cred = picked;
+    provider = {
+      ...getProvider(entry.provider),
+      anthropicBaseURL: config.providers[entry.provider].anthropicBase,
+      openaiBaseURL: config.providers[entry.provider].openaiBase,
+    };
+  } else {
+    try {
+      cred = await auth.getCredential();
+    } catch (err) {
+      if (debug) debugError(reqId, "credential_unavailable", (err as Error).message);
+      printRow(reqId, format, meta, 503, started, Date.now(), 0, 0, 0);
+      return errorResponse(503, "credential_unavailable", (err as Error).message);
+    }
   }
 
   // v2.6: both plans use the Anthropic upstream. coding-plan mirrors the real
@@ -141,9 +210,11 @@ export async function proxyRequest(
   // retired server-side (404 as of 2026-08-28) — the live desktop client now
   // posts Anthropic messages to /api/v1/zcode-plan/anthropic/v1/messages with
   // the start-plan JWT, so we do the same (no OpenAI translation either way).
-  // The hybrid plan auto-switch resolves ONCE per request: the background
-  // watcher may flip the effective plan between requests, never mid-request.
-  let plan: PlanTier = activePlan(config);
+  // The serving plan resolves ONCE per request — from the fleet pick in fleet
+  // mode, from the hybrid auto-switch watcher otherwise; it may change BETWEEN
+  // requests (via rebuilds below), never mid-request.
+  let plan: PlanTier = entry ? entry.plan : activePlan(config);
+  if (entry) meta.account = entry.label;
   let startPlan = plan === "start-plan";
   meta.plan = plan;
   const translateAnthropicToOpenAI = false;
@@ -372,7 +443,63 @@ export async function proxyRequest(
   // with a JSON error envelope — that gateway exhausts a plan that way too
   // (observed live 2026-10-06: 200 + {"code":1005,"msg":"exceed quota
   // limit"}).
-  if (config.planAutoSwitch === true) {
+  // Fleet failover (accounts.enabled): the serving entry's gateway rejected
+  // the request — error status OR a start-plan 200 JSON error envelope. Walk
+  // the (account × plan) chain: rebuild body/headers/URL with each next
+  // usable entry — a different plan AND account, possibly a different
+  // provider — until one serves, else answer a clean 429 listing what was
+  // tried. Each hop cools its entry down so concurrent requests skip it.
+  // This SUBSUMES the single-account plan auto-switch: the chain contains
+  // every plan of every enabled account already.
+  if (fleet && entry) {
+    const evalFirst = await evaluateFleetResponse(upstreamResp, plan);
+    upstreamResp = evalFirst.resp;
+    if (evalFirst.rejected) {
+      const outcome = await walkFleetChain({
+        config,
+        from: entry,
+        firstStatus: upstreamResp.status,
+        onFallback: (message) => {
+          console.log(`${reqId} ${message}`);
+          appendErrorLog({ kind: "fleet_fallback", reqId, message, ...clientTraceFields(clientReq) });
+        },
+        dispatchEntry: (target) => {
+          const targetCred = credentialOf(target);
+          if (!targetCred) throw new Error(`fleet: account "${target.label}" disappeared mid-failover`);
+          cred = targetCred;
+          provider = {
+            ...getProvider(target.provider),
+            anthropicBaseURL: config.providers[target.provider].anthropicBase,
+            openaiBaseURL: config.providers[target.provider].openaiBase,
+          };
+          plan = target.plan;
+          startPlan = plan === "start-plan";
+          meta.plan = plan;
+          transformedBody = transformRequestBody(upstreamBody, { format: upstreamFormat, metadataUserId, startPlan, provider: target.provider });
+          upstreamHeaderPairs = buildUpstreamHeaderPairs(clientReq, upstreamFormat, cred, config.identity, plan, undefined, clientSession);
+          if (useOrderedTransport && translateMode) {
+            upstreamHeaderPairs = capOrderedAcceptEncoding(upstreamHeaderPairs);
+          }
+          upstreamReq = buildUpstreamRequest(clientReq, upstreamFormat, provider, cred, transformedBody, config.identity, plan, undefined, clientSession);
+          return dispatch(upstreamReq, upstreamHeaderPairs);
+        },
+      });
+      if (outcome.exhausted) {
+        const tried = outcome.exhausted.tried.join(", ");
+        appendErrorLog({ kind: "fleet_exhausted", reqId, message: `fleet exhausted: ${tried}`, ...clientTraceFields(clientReq) });
+        printRow(reqId, format, meta, 429, started, headersAt, 0, 0, 0);
+        return errorResponse(429, "fleet_quota_exhausted", `the upstream rejected the request on every account/plan in the fleet (${tried})`);
+      }
+      if (outcome.served) {
+        entry = outcome.served.entry;
+        plan = entry.plan;
+        startPlan = plan === "start-plan";
+        meta.plan = plan;
+        meta.account = entry.label;
+        upstreamResp = outcome.served.resp;
+      }
+    }
+  } else if (config.planAutoSwitch === true) {
     let planRejected = shouldFallbackPlan(upstreamResp.status, plan);
     if (!planRejected && plan === "start-plan" && upstreamResp.status === 200) {
       const sniff = await sniffStartPlanRejection(upstreamResp);
@@ -1049,6 +1176,13 @@ export interface RequestMeta {
   stream: boolean;
   /** Plan the request is served on, set by proxyRequest after resolution. */
   plan?: PlanTier;
+  /** Serving fleet account label (fleet mode), for usage-ledger attribution. */
+  account?: string;
+  /** Client tool from the User-Agent (truncated), for ledger attribution. */
+  tool?: string;
+  /** Virtual key the request presented (attribution), set after admission. */
+  keyId?: string;
+  keyLabel?: string;
   /** Client-supplied correlation ids (clientTraceFields), copied into error-log entries. */
   clientRequestId?: string;
   clientSessionId?: string;
@@ -1229,6 +1363,26 @@ export function printRow(
   avgTps: number,
   streamEndAt: number,
 ): void {
+  // Usage ledger: one line per completed request (success or failure) — the
+  // per-day/tool/account/model/key aggregates come from this stream. Never
+  // throws (appendUsage swallows); never blocks serving.
+  appendUsage({
+    reqId,
+    format: format === "anthropic" ? "ANT" : "OAI",
+    model: meta.model,
+    ...(meta.plan ? { plan: meta.plan } : {}),
+    ...(meta.account ? { account: meta.account } : {}),
+    ...(meta.tool ? { tool: meta.tool } : {}),
+    ...(meta.keyId ? { keyId: meta.keyId } : {}),
+    ...(meta.keyLabel ? { keyLabel: meta.keyLabel } : {}),
+    stream: meta.stream,
+    status,
+    tokens,
+    ttfbMs: headersAt - started,
+    ...(streamEndAt > started ? { totalMs: streamEndAt - started } : {}),
+    ...(meta.clientRequestId ? { clientRequestId: meta.clientRequestId } : {}),
+    ...(meta.clientSessionId ? { clientSessionId: meta.clientSessionId } : {}),
+  });
   if (status >= 400) recordRequestError(reqId, format, meta, status, started, headersAt, tokens, streamEndAt);
   printHeader();
   const tag = format === "anthropic" ? "ANT" : "OAI";
@@ -1268,6 +1422,12 @@ function fmtMs(ms: number): string {
   if (ms < 1000) return `${ms}ms`;
   if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
   return `${Math.floor(ms / 60_000)}m${Math.floor((ms % 60_000) / 1000)}s`;
+}
+
+/** Truncate the User-Agent to a bounded ledger field (`claude-cli/2.0.14 …`). */
+function truncateTool(ua: string): string {
+  const trimmed = ua.trim();
+  return trimmed.length <= 40 ? trimmed : `${trimmed.slice(0, 39)}…`;
 }
 
 /** Persistent error log for every request the client could see fail (4xx/5xx):

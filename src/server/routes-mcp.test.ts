@@ -7,6 +7,10 @@ import { createFetchHandler } from "./server.js";
 import type { ProxyConfig, McpGatewayConfig } from "../config/types.js";
 import { AuthManager } from "../auth/manager.js";
 import type { Credential } from "../auth/types.js";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { beforeEach, afterEach } from "bun:test";
 
 function makeConfig(overrides: Partial<ProxyConfig> = {}, mcpGateway: McpGatewayConfig = { enabled: true, upstreamOrigin: "https://zcode.z.ai" }): ProxyConfig {
   return {
@@ -49,6 +53,20 @@ function upstreamCapture(resp?: Response): { fetch: typeof fetch; seen: () => { 
   }) as typeof fetch;
   return { fetch: impl, seen: () => captured! };
 }
+
+
+// Virtual-key store isolation: the auth gate consults the REAL api-keys.json
+// when no store dir override is set — a machine with virtual keys configured
+// would 401 every keyless test request here. Point the store at a temp dir.
+let keysStoreDir = "";
+beforeEach(() => {
+  keysStoreDir = mkdtempSync(join(tmpdir(), "srv-keys-test-"));
+  process.env.ZCODE_PROXY_STORE_DIR = keysStoreDir;
+});
+afterEach(() => {
+  delete process.env.ZCODE_PROXY_STORE_DIR;
+  rmSync(keysStoreDir, { recursive: true, force: true });
+});
 
 describe("GET /mcp listing", () => {
   it("lists catalogue servers with route metadata (JSON default)", async () => {

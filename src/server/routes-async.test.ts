@@ -19,6 +19,10 @@ function oauthAuth(key = "testkey.testsecret"): AuthManager {
   return auth;
 }
 import type { Credential } from "../auth/types.js";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { beforeEach, afterEach } from "bun:test";
 
 function makeConfig(overrides: Partial<ProxyConfig> = {}): ProxyConfig {
   return {
@@ -201,6 +205,20 @@ async function drain(resp: Response, maxMs: number = 2000): Promise<string> {
   reader.cancel().catch(() => {});
   return new TextDecoder().decode(Buffer.concat(chunks));
 }
+
+
+// Virtual-key store isolation: the auth gate consults the REAL api-keys.json
+// when no store dir override is set — a machine with virtual keys configured
+// would 401 every keyless test request here. Point the store at a temp dir.
+let keysStoreDir = "";
+beforeEach(() => {
+  keysStoreDir = mkdtempSync(join(tmpdir(), "srv-keys-test-"));
+  process.env.ZCODE_PROXY_STORE_DIR = keysStoreDir;
+});
+afterEach(() => {
+  delete process.env.ZCODE_PROXY_STORE_DIR;
+  rmSync(keysStoreDir, { recursive: true, force: true });
+});
 
 describe("/async/* routing", () => {
   it("returns 404 when async.enabled=false", async () => {

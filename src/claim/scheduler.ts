@@ -34,6 +34,8 @@ export interface ClaimSchedulerDeps {
   getCaptcha(): Promise<{ verifyParam: string; region?: string }>;
   config: ClaimSchedulerConfig;
   log?: (message: string) => void;
+  /** Lifecycle events (e.g. notifications): called when a claim succeeds. */
+  onEvent?: (kind: "claimed", planId: string, message: string) => void;
   now?: () => number;
 }
 
@@ -135,7 +137,9 @@ export class ClaimScheduler {
     if (outcome.ok) {
       const endsAtMs = outcome.endsAt !== undefined ? outcome.endsAt * 1000 : undefined;
       this.holdUntil = endsAtMs ?? nowMs + this.deps.config.pollIntervalMs;
-      this.log(`claim: claimed plan ${target.planId}${outcome.startsAt !== undefined ? ` (activates ${new Date(outcome.startsAt * 1000).toISOString()})` : ""}`);
+      const claimedMsg = `claim: claimed plan ${target.planId}${outcome.startsAt !== undefined ? ` (activates ${new Date(outcome.startsAt * 1000).toISOString()})` : ""}`;
+      this.log(claimedMsg);
+      this.deps.onEvent?.("claimed", target.planId, claimedMsg);
       return { action: "claimed", planId: target.planId, startsAt: outcome.startsAt, endsAt: outcome.endsAt };
     }
 

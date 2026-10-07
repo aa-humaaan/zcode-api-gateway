@@ -1,21 +1,52 @@
 /**
- * Encrypted file-based credential store.
- * @see .omo/plans/zcode-proxy.md Task 14
+ * Legacy single-credential store — now an account-aware compatibility seam.
+ *
+ * The primary store is the multi-account fleet store (../accounts/store.ts,
+ * `accounts.json`). These functions keep their old signatures so the many
+ * call sites (serve boot, panel sync, auto-claim, quota routes, control
+ * dispatcher) work unchanged while the account layer lands:
+ *
+ *  - {@link loadCredential} → the ACTIVE account's credential (first enabled
+ *    account in store order).
+ *  - {@link saveCredential} → add-or-refresh an account (a re-login of a
+ *    known account updates it in place; a new login appends a new account).
+ *  - {@link clearCredential} → remove the ACTIVE account; the next enabled
+ *    account takes over. With one account stored this is byte-for-byte the
+ *    old logout.
+ *
+ * Migration is one-way and best-effort: the first `loadCredential` on a
+ * machine that still has only the legacy `credentials.json` copies that
+ * credential into `accounts.json` as the account labeled `default` and LEAVES
+ * the legacy file untouched (older binaries on the same machine keep working;
+ * the file simply goes stale). All encryption lives in ./crypto.ts.
+ *
+ * @see .omo/plans/zcode-proxy.md Task 14 (original single-credential store)
  */
-import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync, renameSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { existsSync, unlinkSync, mkdirSync, readFileSync, writeFileSync, renameSync } from "node:fs";
+import { join } from "node:path";
 import { homedir } from "node:os";
-import { createHash } from "node:crypto";
 import type { Credential } from "./types.js";
+import {
+  getEncryptionKey,
+  getLegacyEncryptionKey,
+  encryptWith,
+  decryptWith,
+} from "./crypto.js";
+import {
+  loadAccounts,
+  activeAccountOf,
+  addAccount,
+  removeActiveAccount,
+  getAccountsStorePath,
+} from "../accounts/store.js";
 
-const ENV_SECRET = "ZCODE_PROXY_CREDENTIAL_SECRET";
-/**
- * Store directory override. Production always uses `~/.zcode-proxy`; this seam
+/** Store directory override. Production always uses `~/.zcode-proxy`; this seam
  * exists so tests can point the store at an isolated temp dir — module-level
  * path constants forced store.test.ts onto the REAL user store, and running
  * the suite on a logged-in machine deleted the user's credentials
  * (`clearCredential` in test hooks, observed 2026-09-18). Evaluated per call
- * so the env var works even when set after module load.
+ * so the env var works even when set after module load. Shared with
+ * ../accounts/store.ts.
  */
 const ENV_STORE_DIR = "ZCODE_PROXY_STORE_DIR";
 
@@ -27,107 +58,66 @@ function storeFile(): string {
   return join(storeDir(), "credentials.json");
 }
 
-/**
- * Derive the AES-GCM key as SHA-256(seed) (audit R2-13). The previous XOR-fold
- * construction was a pseudo-KDF: a seed shorter than 32 bytes left zero blocks
- * in the key. Scope note: on default machine-derived seeds the security gain
- * is ~0 (any same-user process can re-derive the seed either way, 0o600 only
- * stops other users) — the motivation is structural: env-secret deployments
- * (`ZCODE_PROXY_CREDENTIAL_SECRET`) get real 32-byte diffusion, and the
- * misleading "KDF" is gone.
- */
-function getEncryptionKey(): Uint8Array {
-  const seed = process.env[ENV_SECRET] ?? `${homedir()}-${process.platform}-${process.arch}`;
-  return new Uint8Array(createHash("sha256").update(seed, "utf-8").digest());
-}
-
-/**
- * Legacy XOR-fold key (pre-SHA-256 store format). Kept ONLY for the one-shot
- * migration decrypt in {@link loadCredential} — never used for new writes.
- */
-function getLegacyEncryptionKey(): Uint8Array {
-  const hash = new Uint8Array(new ArrayBuffer(32));
-  const encoder = new TextEncoder();
-
-  const seed = process.env[ENV_SECRET] ?? `${homedir()}-${process.platform}-${process.arch}`;
-  const seedBytes = encoder.encode(seed);
-  for (let i = 0; i < seedBytes.length; i++) {
-    hash[i % 32] ^= seedBytes[i];
-  }
-  return hash;
-}
-
 /** Atomic store write: temp file (0o600) + rename over the target. */
 function atomicWriteStore(contents: string): void {
   const target = storeFile();
   const tmp = `${target}.tmp-${process.pid}-${Date.now()}`;
+  mkdirSync(storeDir(), { recursive: true });
   writeFileSync(tmp, contents, { mode: 0o600 });
   renameSync(tmp, target);
-}
-
-async function importAesKey(raw: Uint8Array): Promise<CryptoKey> {
-  // Copy into a plain ArrayBuffer: bun-types types Uint8Array as
-  // ArrayBufferLike, which is not assignable to BufferSource.
-  const ab = new ArrayBuffer(raw.byteLength);
-  new Uint8Array(ab).set(raw);
-  return crypto.subtle.importKey(
-    "raw",
-    ab,
-    { name: "AES-GCM" },
-    false,
-    ["encrypt", "decrypt"],
-  );
-}
-
-async function encryptWith(key: Uint8Array, plaintext: string): Promise<string> {
-  const aesKey = await importAesKey(key);
-
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const encoder = new TextEncoder();
-  const encrypted = await crypto.subtle.encrypt(
-    { name: "AES-GCM", iv },
-    aesKey,
-    encoder.encode(plaintext),
-  );
-
-  const combined = new Uint8Array(iv.length + encrypted.byteLength);
-  combined.set(iv, 0);
-  combined.set(new Uint8Array(encrypted), iv.length);
-
-  return Buffer.from(combined).toString("base64");
-}
-
-async function decryptWith(key: Uint8Array, ciphertext: string): Promise<string> {
-  const aesKey = await importAesKey(key);
-
-  const combined = Buffer.from(ciphertext, "base64");
-  const iv = combined.slice(0, 12);
-  const data = combined.slice(12);
-
-  const decrypted = await crypto.subtle.decrypt(
-    { name: "AES-GCM", iv },
-    aesKey,
-    data,
-  );
-
-  return new TextDecoder().decode(decrypted);
 }
 
 async function encrypt(plaintext: string): Promise<string> {
   return encryptWith(getEncryptionKey(), plaintext);
 }
 
+/**
+ * Save a credential — add-or-refresh an account in the fleet store. Returns
+ * nothing (legacy signature); the accounts CLI surfaces the added/refreshed
+ * label by calling ../accounts/store.ts directly.
+ */
 export async function saveCredential(cred: Credential): Promise<void> {
-  mkdirSync(dirname(storeFile()), { recursive: true });
-  const json = JSON.stringify(cred);
-  const encrypted = await encrypt(json);
-  atomicWriteStore(JSON.stringify({ encrypted }));
+  await addAccount(cred);
 }
 
+/**
+ * Load the credential of the ACTIVE account (first enabled in store order).
+ *
+ * When only the legacy `credentials.json` exists, it is read once more here
+ * (including the XOR-fold → SHA-256 one-shot re-decrypt) and migrated into
+ * `accounts.json` as the `default` account — best-effort by design: a failed
+ * migration write (read-only dir, AV lock on Windows, …) must not fail the
+ * load; the credential is returned either way and the migration retries on
+ * the next boot.
+ */
 export async function loadCredential(): Promise<Credential | null> {
+  if (existsSync(getAccountsStorePath())) {
+    const accounts = await loadAccounts();
+    return activeAccountOf(accounts)?.credential ?? null;
+  }
   if (!existsSync(storeFile())) return null;
-  const raw = readFileSync(storeFile(), "utf-8");
-  const parsed = JSON.parse(raw);
+
+  const cred = await loadLegacyCredential();
+  if (cred) {
+    try {
+      await addAccount(cred, { label: "default" });
+      console.log(`Migrated stored credential to the accounts store (${getAccountsStorePath()}) as "default"`);
+    } catch (e) {
+      console.warn(`Accounts-store migration failed (will retry next load): ${(e as Error).message}`);
+    }
+  }
+  return cred;
+}
+
+/** The pre-fleet loader: legacy file, new KDF first, XOR-fold fallback. */
+async function loadLegacyCredential(): Promise<Credential | null> {
+  let raw: string;
+  try {
+    raw = readFileSync(storeFile(), "utf-8");
+  } catch {
+    return null; // vanished mid-boot (e.g. concurrent logout) — not an error
+  }
+  const parsed = JSON.parse(raw) as { encrypted?: string };
   if (!parsed.encrypted) return null;
 
   let json: string;
@@ -163,12 +153,26 @@ export async function loadCredential(): Promise<Credential | null> {
   }
 }
 
+/**
+ * Log out of the ACTIVE account: removed from the fleet store, next enabled
+ * account (if any) becomes active. Falls back to deleting the legacy file
+ * when no accounts store exists yet (pre-migration machines).
+ */
 export function clearCredential(): void {
+  if (existsSync(getAccountsStorePath())) {
+    // Fire-and-forget is deterministic here: removeActiveAccount reads,
+    // splices and WRITES the store synchronously before its first await, so
+    // the on-disk removal is complete by the time this returns (the async
+    // tail only decrypts the removed record for the result payload).
+    void removeActiveAccount();
+    return;
+  }
   if (existsSync(storeFile())) {
     unlinkSync(storeFile());
   }
 }
 
+/** Path of the LEGACY single-credential file (kept for tests and messages). */
 export function getStorePath(): string {
   return storeFile();
 }

@@ -7,7 +7,14 @@ import { watchConfigFile, type ConfigWatchHandles } from "./config/watch.js";
 import { AuthManager } from "./auth/manager.js";
 import { startServer, type ProxyServer } from "./server/server.js";
 import { collectQuotaSnapshot } from "./server/routes-quota.js";
-import { loadCredential, saveCredential, clearCredential, getStorePath } from "./auth/store.js";
+import { loadCredential, clearCredential, getStorePath } from "./auth/store.js";
+import { AccountManager } from "./accounts/manager.js";
+import { getAccountsStorePath } from "./accounts/store.js";
+import { createFleetRouter, syncFleet, fleetSnapshot, type FleetRouter } from "./accounts/router.js";
+import { loadAccounts } from "./accounts/store.js";
+import { addKey, listKeys, removeKey, setKeyDisabled, getKeysStorePath } from "./keys/keys.js";
+import { readUsageDays, summarizeUsage, usageLogPath } from "./ledger/ledger.js";
+import { configureNotify } from "./notify/notify.js";
 import { ZaiOAuthClient, BigmodelOAuthClient, BigmodelPollOAuthClient, LOGIN_TIMEOUT_MS, parsePastedCallbackUrl, type OAuthResult } from "./auth/oauth.js";
 import { KeyResolver } from "./auth/resolver.js";
 import type { Credential } from "./auth/types.js";
@@ -100,6 +107,12 @@ function dispatchCli(args: string[]): void {
 
   if (cmd === "auth") {
     authCommand(args.slice(1));
+  } else if (cmd === "accounts") {
+    void accountsCommand(args.slice(1));
+  } else if (cmd === "keys") {
+    void keysCommand(args.slice(1));
+  } else if (cmd === "usage") {
+    void usageCommand(args.slice(1));
   } else if (cmd === "claim") {
     void claimCommand(args.slice(1));
   } else if (cmd === "quota") {
@@ -147,10 +160,20 @@ Usage:
                                     Start with verbose per-request diagnostics
   zcode-proxy --cli                 Classic CLI mode (bare --cli = serve)
   zcode-proxy auth login <provider> Login via OAuth (provider: zai | bigmodel)
+                                    Adds an account; repeat for multiple accounts
   zcode-proxy auth login <provider> --import
                                     Import API key from ~/.zcode/v2/config.json
-  zcode-proxy auth logout           Clear stored credentials
+  zcode-proxy auth logout           Log out of the ACTIVE account (next takes over)
   zcode-proxy auth status           Show current authentication state
+  zcode-proxy accounts list         List accounts (order = serving priority)
+  zcode-proxy accounts remove <label>
+  zcode-proxy accounts enable|disable <label>
+  zcode-proxy accounts rename <old> <new>
+  zcode-proxy keys add <label> [--requests-per-day N] [--tokens-per-day N] [--models m1,m2]
+                                    Issue a virtual key for one tool (shown once)
+  zcode-proxy keys list             List virtual keys
+  zcode-proxy keys remove|enable|disable <label>
+  zcode-proxy usage [days]          Usage totals (default 7 days): by day/tool/account/model/key
   zcode-proxy claim [list|now]      List / claim weekend-plan trial packages
   zcode-proxy quota                 Show plan quota (per-model remaining/total)
   zcode-proxy version               Show version
@@ -209,11 +232,13 @@ async function startServePanel(
     auth: AuthManager;
     serverRef: { current: ProxyServer | null };
     logBuffer: LogBuffer;
+    /** Fleet router when accounts.enabled — mutated accounts re-sync immediately. */
+    fleet: FleetRouter | null;
     /** Unwind the process; independent of whether the proxy is still running. */
     shutdown: () => void;
   },
 ): Promise<PanelServer> {
-  const { config, path, auth, serverRef, logBuffer, shutdown } = ctx;
+  const { config, path, auth, serverRef, logBuffer, shutdown, fleet } = ctx;
 
   // The panel can log out (or log in another account) while `serve` keeps
   // running, but AuthManager caches the credential in memory and auto-claim
@@ -250,7 +275,11 @@ async function startServePanel(
     auth.setOAuthCredential(cred);
     authFingerprint = JSON.stringify(cred);
     try {
-      const s = await startServer(buildServerOptions(config, auth, false));
+      // Fleet re-resolved per start (mirrors the TUI): a hot-reload flip of
+      // accounts.enabled applies on the next panel-side start/stop.
+      const panelFleet = config.accounts?.enabled ? createFleetRouter(config) : null;
+      if (panelFleet) await panelFleet.sync();
+      const s = await startServer(buildServerOptions(config, auth, false, panelFleet ?? undefined));
       serverRef.current = s;
       console.log(`zcode-proxy listening on http://${s.hostname}:${s.port}`);
       return { ok: true, port: s.port };
@@ -294,6 +323,25 @@ async function startServePanel(
     onStopProxy: stopProxy,
     onSetConfig: setConfig,
     onQuota: () => collectQuotaSnapshot(config),
+    onAccounts: async () => {
+      // Pure snapshot, but re-sync from the store first so a panel login that
+      // just added an account shows up on the next poll without waiting for
+      // the fleet watcher's tick.
+      if (fleet) await fleet.sync();
+      else syncFleet(await loadAccounts().catch(() => []));
+      return fleetSnapshot(config);
+    },
+    onAccountsMutate: async (op, ref) => {
+      const manager = new AccountManager();
+      const result = await manager.setEnabled(ref, op === "enable");
+      if (!result.ok) return { ok: false, error: result.error ?? "unknown" };
+      // Immediate effect: the router picks up the new enabled flags on its
+      // next pickServing instead of waiting for the watcher tick.
+      if (fleet) await fleet.sync();
+      console.log(`panel: account "${result.account?.label ?? ref}" ${op}d`);
+      return { ok: true };
+    },
+    onUsage: async (days) => summarizeUsage(readUsageDays(days), days),
   });
 
   /** Grace period for the `shutdown` reply before `process.exit()` runs. */
@@ -351,6 +399,7 @@ export function createServeJobs(
   config: ProxyConfig,
   auth: AuthManager,
   jobLabels: { indent?: string; note?: string } = {},
+  fleet?: FleetRouter | null,
 ): {
   startInitial(): void;
   handles: ConfigWatchHandles;
@@ -360,11 +409,14 @@ export function createServeJobs(
   const note = jobLabels.note ?? "";
   let claimScheduler: { stop: () => void } | null = null;
   let planWatcher: { stop: () => void } | null = null;
+  let fleetWatcher: { stop: () => void } | null = null;
+  let fleetRouter: FleetRouter | null = fleet ?? null;
   let captchaModule: { shutdownCaptcha: () => void } | null = null;
   // The dynamic imports resolve asynchronously; the pending flags keep a
   // config reload racing the first start from double-starting a job.
   let claimPending = false;
   let planPending = false;
+  let fleetPending = false;
   let captchaPoolStarted = false;
 
   const startClaimJob = (): void => {
@@ -409,6 +461,28 @@ export function createServeJobs(
     planWatcher = null;
     console.log(`${indent}plan auto-switch: OFF`);
   };
+  const startFleetJob = (): void => {
+    stopFleetJob(); // restart-safe: a dirty accounts block re-runs this with the new fields
+    fleetPending = true;
+    import("./accounts/router.js")
+      .then((m) => {
+        fleetPending = false;
+        if (!fleetRouter) fleetRouter = m.createFleetRouter(config);
+        fleetWatcher = fleetRouter.startWatcher();
+        console.log(`${indent}fleet router: ON (strategy ${config.accounts?.strategy ?? "priority"}, poll ${formatDuration((config.accounts?.pollIntervalSec ?? 60) * 1000)}${note})`);
+      })
+      .catch((err) => {
+        fleetPending = false;
+        console.error(`[fleet] watcher failed to start: ${(err as Error).message}`);
+      });
+  };
+  const stopFleetJob = (): void => {
+    fleetPending = false;
+    if (!fleetWatcher) return;
+    fleetWatcher.stop();
+    fleetWatcher = null;
+    console.log(`${indent}fleet router: OFF`);
+  };
   const warmCaptchaPoolJob = (): void => {
     if (captchaPoolStarted || config.plan !== "start-plan") return;
     // Pre-solve the captcha token pool in the background so first requests
@@ -429,7 +503,13 @@ export function createServeJobs(
     startInitial() {
       if (config.plan === "start-plan") warmCaptchaPoolJob();
       if (config.claim.enabled && config.claim.auto) startClaimJob();
-      if (config.planAutoSwitch) startPlanWatcherJob();
+      if (config.accounts?.enabled) {
+        // Fleet mode: the (account × plan) chain failover subsumes the
+        // single-account plan auto-switch — running both would double-poll.
+        startFleetJob();
+      } else if (config.planAutoSwitch) {
+        startPlanWatcherJob();
+      }
     },
     handles: {
       claimRunning: () => claimScheduler !== null || claimPending,
@@ -438,9 +518,21 @@ export function createServeJobs(
       planWatcherRunning: () => planWatcher !== null || planPending,
       startPlanWatcher: startPlanWatcherJob,
       stopPlanWatcher: stopPlanWatcherJob,
+      fleetRunning: () => fleetWatcher !== null || fleetPending,
+      startFleet: startFleetJob,
+      stopFleet: stopFleetJob,
       warmCaptchaPool: warmCaptchaPoolJob,
     },
     stopForShutdown(cleared) {
+      if (fleetWatcher) {
+        try {
+          fleetWatcher.stop();
+          cleared.push("fleet router");
+        } catch {
+          /* already stopped */
+        }
+        fleetWatcher = null;
+      }
       if (planWatcher) {
         try {
           planWatcher.stop();
@@ -480,6 +572,7 @@ async function serve(configPath: string | undefined, debug: boolean): Promise<vo
     console.log(`Run: zcode-proxy auth login <zai|bigmodel>\n`);
   }
   const config = loadConfig(path);
+  configureNotify(config);
 
   // Optional web panel (issue #58). Resolved early so console output from the
   // startup path below is already captured for the panel's Logs card.
@@ -494,9 +587,14 @@ async function serve(configPath: string | undefined, debug: boolean): Promise<vo
   }
   auth.setOAuthCredential(cred);
 
+  // Fleet router (accounts.enabled): sync the snapshot BEFORE the server
+  // starts so the very first request has a serving pick available.
+  const fleet = config.accounts?.enabled ? createFleetRouter(config) : null;
+  if (fleet) await fleet.sync();
+
   if (debug) printDebugBanner(config, path, cred);
 
-  const server = await startServer(buildServerOptions(config, auth, debug));
+  const server = await startServer(buildServerOptions(config, auth, debug, fleet ?? undefined));
   // The optional panel can stop and restart the proxy, so the signal handlers
   // and the lifecycle hooks go through this ref rather than the initial handle.
   const serverRef: { current: ProxyServer | null } = { current: server };
@@ -504,7 +602,7 @@ async function serve(configPath: string | undefined, debug: boolean): Promise<vo
   console.log(`zcode-proxy listening on ${url}`);
   // Handles for the background timers started below, so `shutdown` can clear
   // them without the proxy handle being involved (issue #58 review, P2).
-  const jobs = createServeJobs(config, auth);
+  const jobs = createServeJobs(config, auth, {}, fleet);
   jobs.startInitial();
 
   // Hot reload: edits to config.yaml apply in place without a restart
@@ -565,6 +663,7 @@ async function serve(configPath: string | undefined, debug: boolean): Promise<vo
         auth,
         serverRef,
         logBuffer: panelLogBuffer,
+        fleet,
         shutdown,
       });
     } catch (err) {
@@ -609,13 +708,191 @@ function authCommand(args: string[]): void {
   if (sub === "login") {
     authLogin(args.slice(1));
   } else if (sub === "logout") {
-    authLogout();
+    void authLogout();
   } else if (sub === "status") {
-    authStatus();
+    void authStatus();
   } else {
     console.error("Usage: zcode-proxy auth <login|logout|status>");
+    console.error("Account fleet management: zcode-proxy accounts <list|remove|enable|disable|rename>");
     process.exit(1);
   }
+}
+
+/**
+ * `keys` subcommand — manage virtual API keys (per-tool attribution, caps,
+ * model allowlists). The full key is printed ONCE at creation; the store keeps
+ * only a hash.
+ */
+async function keysCommand(args: string[]): Promise<void> {
+  const sub = args[0] ?? "list";
+
+  if (sub === "add") {
+    const label = args[1];
+    if (!label) {
+      console.error("Usage: zcode-proxy keys add <label> [--requests-per-day N] [--tokens-per-day N] [--models m1,m2]");
+      process.exit(1);
+    }
+    const flagValue = (name: string): number | undefined => {
+      const at = args.indexOf(name);
+      if (at < 0) return undefined;
+      const n = parseInt(args[at + 1] ?? "", 10);
+      if (!Number.isInteger(n) || n < 1) {
+        console.error(`${name} must be a positive integer`);
+        process.exit(1);
+      }
+      return n;
+    };
+    const requestsPerDay = flagValue("--requests-per-day");
+    const tokensPerDay = flagValue("--tokens-per-day");
+    const modelsAt = args.indexOf("--models");
+    const models = modelsAt >= 0 ? (args[modelsAt + 1] ?? "").split(",").map((m) => m.trim()).filter(Boolean) : undefined;
+
+    const result = addKey({ label, ...(requestsPerDay !== undefined ? { requestsPerDay } : {}), ...(tokensPerDay !== undefined ? { tokensPerDay } : {}), ...(models && models.length > 0 ? { models } : {}) });
+    if (!result.ok) {
+      console.error(`keys: ${result.error}`);
+      process.exit(1);
+    }
+    console.log(`Virtual key "${label}" created. Store it in your tool NOW — it is shown once:`);
+    console.log(`\n  ${result.issued.fullKey}\n`);
+    if (result.issued.entry.caps) {
+      const caps = result.issued.entry.caps;
+      const bits = [
+        caps.requestsPerDay !== undefined ? `${caps.requestsPerDay} requests/day` : null,
+        caps.tokensPerDay !== undefined ? `${caps.tokensPerDay} tokens/day` : null,
+      ].filter(Boolean);
+      console.log(`  Caps: ${bits.join(", ")}`);
+    }
+    if (result.issued.entry.models) console.log(`  Models: ${result.issued.entry.models.join(", ")}`);
+    console.log(`  Store:  ${getKeysStorePath()}`);
+    return;
+  }
+
+  if (sub === "list") {
+    const keys = listKeys();
+    if (keys.length === 0) {
+      console.log("No virtual keys. Add one: zcode-proxy keys add <label>");
+      return;
+    }
+    console.log(`Virtual keys (${keys.length}):`);
+    for (const k of keys) {
+      const caps = k.caps
+        ? ` caps: ${[k.caps.requestsPerDay !== undefined ? `${k.caps.requestsPerDay}r/d` : null, k.caps.tokensPerDay !== undefined ? `${k.caps.tokensPerDay}tok/d` : null].filter(Boolean).join(", ")}`
+        : "";
+      const models = k.models ? ` models: ${k.models.join(",")}` : "";
+      const state = k.disabled ? " [disabled]" : "";
+      console.log(`  ${k.label}${state} — ${k.prefix}…${caps}${models}`);
+    }
+    return;
+  }
+
+  if (sub === "remove" || sub === "enable" || sub === "disable") {
+    const ref = args[1];
+    if (!ref) {
+      console.error(`Usage: zcode-proxy keys ${sub} <label>`);
+      process.exit(1);
+    }
+    const result = sub === "remove" ? removeKey(ref) : setKeyDisabled(ref, sub === "disable");
+    if (!result.ok) {
+      console.error(`keys: ${result.error}`);
+      process.exit(1);
+    }
+    console.log(sub === "remove" ? `Removed key "${result.label}".` : `Key "${result.label}" is now ${sub}d.`);
+    return;
+  }
+
+  console.error("Usage: zcode-proxy keys <add|list|remove|enable|disable>");
+  process.exit(1);
+}
+
+/**
+ * `usage [days]` — print the local usage ledger aggregates: per day, tool
+ * (User-Agent), fleet account, model and virtual key. Reads only the local
+ * file — no upstream calls.
+ */
+async function usageCommand(args: string[]): Promise<void> {
+  const days = Math.min(365, Math.max(1, parseInt(args[0] ?? "7", 10) || 7));
+  const entries = readUsageDays(days);
+  if (entries.length === 0) {
+    console.log(`No usage recorded in the last ${days} day${days === 1 ? "" : "s"} (ledger: ${usageLogPath()}).`);
+    return;
+  }
+  const summary = summarizeUsage(entries, days);
+  console.log(`Usage — last ${days} day${days === 1 ? "" : "s"}: ${summary.totalRequests.toLocaleString("en-US")} requests, ${summary.totalTokens.toLocaleString("en-US")} tokens, ${summary.failedRequests} failed`);
+  printUsageTotals("By day", summary.byDay);
+  printUsageTotals("By tool", summary.byTool);
+  printUsageTotals("By account", summary.byAccount);
+  printUsageTotals("By model", summary.byModel);
+  printUsageTotals("By key", summary.byKey);
+  console.log(`  Ledger: ${usageLogPath()}`);
+}
+
+function printUsageTotals(title: string, totals: { name: string; requests: number; tokens: number }[]): void {
+  console.log(`  ${title}:`);
+  for (const t of totals) {
+    console.log(`    ${t.name.padEnd(28)} ${String(t.requests).padStart(6)} req  ${t.tokens.toLocaleString("en-US").padStart(14)} tok`);
+  }
+}
+
+/**
+ * `accounts` subcommand — manage the account fleet. Store order IS serving
+ * priority: the first enabled account serves (`(active)` marker in `list`).
+ */
+async function accountsCommand(args: string[]): Promise<void> {
+  const sub = args[0] ?? "list";
+  const manager = new AccountManager();
+  const labelArg = args[1];
+
+  if (sub === "list") {
+    await printAccountList(manager);
+    return;
+  }
+
+  if (sub === "remove" || sub === "enable" || sub === "disable" || sub === "rename") {
+    if (!labelArg || (sub === "rename" && !args[2])) {
+      console.error(`Usage: zcode-proxy accounts ${sub} ${sub === "rename" ? "<old-label> <new-label>" : "<label>"}`);
+      process.exit(1);
+    }
+  } else {
+    console.error("Usage: zcode-proxy accounts <list|remove|enable|disable|rename>");
+    process.exit(1);
+  }
+
+  const result = sub === "rename"
+    ? await manager.rename(labelArg, args[2]!)
+    : sub === "remove"
+      ? await manager.remove(labelArg)
+      : await manager.setEnabled(labelArg, sub === "enable");
+
+  if (!result.ok) {
+    console.error(`accounts: ${result.error}`);
+    process.exit(1);
+  }
+  const label = result.account?.label ?? labelArg;
+  if (sub === "remove") {
+    console.log(`Removed account "${label}" (${result.total} left).`);
+  } else if (sub === "rename") {
+    console.log(`Renamed to "${label}".`);
+  } else {
+    console.log(`Account "${label}" is now ${sub === "enable" ? "enabled" : "disabled"} (serving skipped).`);
+  }
+  await printAccountList(manager);
+}
+
+/** Shared `accounts list` / `auth status` rendering: the fleet, active first-marked. */
+async function printAccountList(manager: AccountManager): Promise<void> {
+  const accounts = await manager.list();
+  if (accounts.length === 0) {
+    console.log("No accounts. Add one: zcode-proxy auth login <zai|bigmodel>");
+    return;
+  }
+  const active = await manager.getActive();
+  console.log(`Accounts (order = serving priority, ${accounts.length} total):`);
+  for (const a of accounts) {
+    const marker = active && a.id === active.id ? " (active)" : "";
+    const state = a.enabled ? "" : " [disabled]";
+    console.log(`  ${a.label}${state}${marker} — ${a.provider}, key ${a.credential.apiKey.slice(0, 8)}…`);
+  }
+  console.log(`  Store: ${getAccountsStorePath()}`);
 }
 
 async function claimCommand(args: string[]): Promise<void> {
@@ -738,11 +1015,19 @@ async function authLogin(args: string[]): Promise<void> {
     if (jwt) cred.jwt = jwt;
   }
 
-  await saveCredential(cred);
-  console.log(`\nLogged in as ${provider}.`);
-  console.log(`  API Key: ${cred.apiKey.substring(0, 12)}...`);
-  if (cred.userId) console.log(`  User ID: ${cred.userId}`);
-  console.log(`  Stored:  ${getStorePath()}`);
+  // Fleet semantics: a NEW login appends an account; re-logging the SAME
+  // upstream account (same user id / API key) refreshes it in place.
+  const manager = new AccountManager();
+  const { account, updatedExisting, total } = await manager.add(cred);
+  console.log(
+    updatedExisting
+      ? `\nRefreshed existing account "${account.label}" (${total} account${total === 1 ? "" : "s"} stored).`
+      : `\nAdded account "${account.label}" (${total} account${total === 1 ? "" : "s"} stored).`,
+  );
+  console.log(`  Provider: ${cred.provider}`);
+  console.log(`  API Key:  ${cred.apiKey.substring(0, 12)}...`);
+  if (cred.userId) console.log(`  User ID:  ${cred.userId}`);
+  console.log(`  Store:    ${getAccountsStorePath()}`);
 }
 
 /**
@@ -795,25 +1080,45 @@ export function ensureDeviceMidInConfig(path: string): string {
   return mid;
 }
 
-function authLogout(): void {
-  if (!existsSync(getStorePath())) {
+/**
+ * `auth logout` — removes the ACTIVE account. With a fleet stored, the next
+ * enabled account takes over as active (and starts serving on next boot);
+ * with the pre-fleet single credential this is exactly the old full logout.
+ */
+async function authLogout(): Promise<void> {
+  const manager = new AccountManager();
+  const before = await manager.list();
+  if (before.length === 0 && !existsSync(getStorePath())) {
     console.log("Not logged in.");
     return;
   }
-  clearCredential();
-  console.log("Logged out. Credentials removed.");
+
+  const result = await manager.removeActive();
+  if (!result.ok) {
+    // No enabled account in the store, but a legacy credential may remain.
+    clearCredential();
+    console.log("Logged out. Credentials removed.");
+    return;
+  }
+
+  const label = result.account?.label ?? "(unknown)";
+  if (result.total === 0) {
+    console.log(`Logged out of "${label}". No accounts remain — run: zcode-proxy auth login <zai|bigmodel>`);
+    return;
+  }
+  const next = await manager.getActive();
+  console.log(`Logged out of "${label}". ${result.total} account${result.total === 1 ? "" : "s"} remain, active is now "${next?.label ?? "none"}".`);
 }
 
 async function authStatus(): Promise<void> {
-  const cred = await loadCredential();
-  if (!cred) {
+  const manager = new AccountManager();
+  const accounts = await manager.list();
+  if (accounts.length === 0 && !existsSync(getStorePath())) {
     console.log("Not logged in.");
     console.log("Run: zcode-proxy auth login <zai|bigmodel>");
     return;
   }
-  console.log(`Logged in: ${cred.provider}`);
-  console.log(`  API Key: ${cred.apiKey.substring(0, 12)}...`);
-  console.log(`  Store:   ${getStorePath()}`);
+  await printAccountList(manager);
 }
 
 async function runOAuth(provider: ProviderId, pasteMode: boolean): Promise<OAuthResult> {

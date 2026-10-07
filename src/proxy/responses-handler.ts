@@ -41,7 +41,7 @@ async function loadCaptcha(): Promise<CaptchaModule> {
 import { getDefaultEndpointRouting, type EndpointRoutingService } from "./endpoint-routing.js";
 import { getDefaultClientSigning, sendWithClientSigning, type ClientSigningManager } from "./client-signing.js";
 import { buildAnthropicMetadataUserId } from "./trace-headers.js";
-import { credentialString } from "../auth/types.js";
+import { credentialString, type Credential } from "../auth/types.js";
 import { translateRequestOpenAIToAnthropic, translateResponseAnthropicToOpenAI } from "../translator/openai-to-anthropic.js";
 import { anthropicSseToOpenaiSse, AnthropicStreamError } from "../translator/sse-translator.js";
 import type { AnthropicMessagesRequest, AnthropicMessagesResponse } from "../translator/types.js";
@@ -69,6 +69,9 @@ import {
 import { ResponseStore, type StoredResponse } from "../responses/store.js";
 import { errorResponse, readBody, InflatedBodyTooLargeError, unreachableMessage } from "./handler.js";
 import { activePlan, planPriorityOf, retryOnPlanExhausted, shouldFallbackPlan, sniffStartPlanRejection, type PlanTier } from "../plan/auto.js";
+import { pickServing, credentialOf, walkFleetChain, evaluateFleetResponse, fleetChain, type FleetRouter, type ChainEntry } from "../accounts/router.js";
+import { appendUsage } from "../ledger/ledger.js";
+import { resolveRequestKey, admitRequest } from "../keys/keys.js";
 
 export interface ResponsesHandlerOptions {
   config: ProxyConfig;
@@ -85,6 +88,12 @@ export interface ResponsesHandlerOptions {
   clientSigning?: ClientSigningManager | null;
   /** Override the lazily-imported captcha module (for testing). */
   captcha?: CaptchaModule;
+  /**
+   * Fleet router (multi-account failover) when `accounts.enabled` is on —
+   * mirrors handler.ts: strategy-aware pick, chain-walk failover, provider
+   * rebuilds per target entry.
+   */
+  fleet?: FleetRouter;
 }
 
 /** Handle POST /v1/responses. */
@@ -157,21 +166,71 @@ export async function handleResponses(
   }
   const { chatRequest, customToolNames, namespaceMap, hasToolSearch } = translated;
 
-  // ── 4. credential + provider ──
-  let cred;
-  try {
-    cred = await opts.auth.getCredential();
-  } catch (err) {
-    return errorResponse(503, "credential_unavailable", (err as Error).message);
+  // ── 3b. tool attribution + virtual-key admission (mirrors handler.ts) ──
+  // The Codex route must not bypass a virtual key's caps/allowlist just
+  // because it speaks Responses instead of chat/messages.
+  const userAgent = clientReq.headers.get("user-agent");
+  const tool = userAgent ? (userAgent.trim().length <= 40 ? userAgent.trim() : `${userAgent.trim().slice(0, 39)}…`) : undefined;
+  const vkey = resolveRequestKey(clientReq);
+  if (vkey) {
+    // Attribute at presentation (ledger honesty), then enforce the policy.
+    const admission = admitRequest(vkey, req.model);
+    if (!admission.ok) {
+      const status = admission.status ?? 401;
+      appendUsage({
+        reqId: "[responses]", format: "OAI", model: req.model, stream,
+        status, tokens: 0, ttfbMs: Date.now() - start,
+        keyId: vkey.id, keyLabel: vkey.label, ...(tool ? { tool } : {}),
+      });
+      return errorResponse(
+        status,
+        status === 429 ? "key_cap_reached" : status === 403 ? "model_not_allowed" : "key_disabled",
+        admission.reason ?? "rejected by virtual key policy",
+      );
+    }
   }
-  const providerDef = resolveProviderDef(opts.config);
+  const keyFields = vkey ? { keyId: vkey.id, keyLabel: vkey.label } : {};
+
+  // ── 4. credential + provider ──
+  // Fleet mode mirrors handler.ts: the strategy pick decides the serving
+  // (account, plan, provider); single account keeps the AuthManager path.
+  const fleet = opts.fleet;
+  let entry: ChainEntry | null = null;
+  let cred: Credential;
+  if (fleet) {
+    entry = pickServing(opts.config);
+    if (!entry) {
+      // 429 while entries merely cool down; 503 only when nothing is enabled.
+      const hasEnabled = fleetChain(opts.config).length > 0;
+      const message = hasEnabled
+        ? "every account/plan in the fleet is cooling down after rejections — retry shortly"
+        : "no enabled account in the fleet — run: zcode-proxy auth login <zai|bigmodel> (or enable one: zcode-proxy accounts enable <label>)";
+      return errorResponse(hasEnabled ? 429 : 503, hasEnabled ? "fleet_quota_exhausted" : "credential_unavailable", message);
+    }
+    const picked = credentialOf(entry);
+    if (!picked) {
+      return errorResponse(503, "credential_unavailable", `fleet account "${entry.label}" disappeared mid-pick`);
+    }
+    cred = picked;
+  } else {
+    try {
+      cred = await opts.auth.getCredential();
+    } catch (err) {
+      return errorResponse(503, "credential_unavailable", (err as Error).message);
+    }
+  }
+  let providerDef = resolveProviderDef(opts.config, entry?.provider);
 
   // ── 5. body transform (start-plan system / anthropic cache_control + user_id) ──
   // Both plans post Anthropic upstream (mirrors handler.ts): the start-plan
   // OpenAI gateway was retired server-side (404 as of 2026-08-28), so the
   // Responses → Chat → Anthropic translator chain runs unconditionally.
-  // The plan auto-switch resolves ONCE per request, like handler.ts.
-  let plan: PlanTier = activePlan(opts.config);
+  // The plan auto-switch resolves ONCE per request, like handler.ts; in fleet
+  // mode the picked entry decides the plan.
+  let plan: PlanTier = entry ? entry.plan : activePlan(opts.config);
+  // Serving-account attribution for the usage ledger; the fleet walk updates
+  // it when the request actually lands on a later chain entry.
+  let servingAccount: string | undefined = entry?.label;
   let startPlan = plan === "start-plan";
   const upstreamFormat: "openai" | "anthropic" = "anthropic";
   // userId mirrors handler.ts for BOTH plans: the bundle's `E2e` is
@@ -201,7 +260,7 @@ export async function handleResponses(
       format: "anthropic",
       metadataUserId,
       startPlan,
-      provider: opts.config.provider,
+      provider: entry?.provider ?? opts.config.provider,
     }) ?? anthropicJson;
   }
 
@@ -266,6 +325,7 @@ export async function handleResponses(
   };
 
   let upstreamResp: Response;
+  const dispatchStartedAt = Date.now();
   try {
     // Connect-retry ladder mirrors the chat hot path (handler.ts): 3 attempts,
     // fresh Request per dispatch (built inside `dispatch`), 500ms×attempt
@@ -286,6 +346,7 @@ export async function handleResponses(
     }
     return errorResponse(502, "upstream_unreachable", unreachableMessage(err));
   }
+  const headersAt = Date.now();
 
   // Hybrid plan auto-switch (mirrors handler.ts, only while planAutoSwitch
   // is on — with it off, plan selection is entirely the operator's config):
@@ -295,7 +356,58 @@ export async function handleResponses(
   // the start-plan variants). Runs before the captcha retry so a dead plan
   // never spends a pooled token. Rejection covers error statuses AND, on
   // start-plan, HTTP 200 with a JSON error envelope.
-  if (opts.config.planAutoSwitch === true) {
+  // Fleet failover (mirrors handler.ts): walk the (account × plan) chain on
+  // rejection — each hop rebuilds credential, provider and plan-specific body
+  // — until one serves, else a clean 429. Subsumes the plan auto-switch.
+  if (fleet && entry) {
+    const evalFirst = await evaluateFleetResponse(upstreamResp, plan);
+    upstreamResp = evalFirst.resp;
+    if (evalFirst.rejected) {
+      const outcome = await walkFleetChain({
+        config: opts.config,
+        from: entry,
+        firstStatus: upstreamResp.status,
+        onFallback: (message) => {
+          console.log(`[responses] ${message}`);
+          appendErrorLog({ kind: "fleet_fallback", reqId: "[responses]", message, ...traceFields });
+        },
+        dispatchEntry: (target) => {
+          const targetCred = credentialOf(target);
+          if (!targetCred) throw new Error(`fleet: account "${target.label}" disappeared mid-failover`);
+          cred = targetCred;
+          providerDef = resolveProviderDef(opts.config, target.provider);
+          plan = target.plan;
+          startPlan = plan === "start-plan";
+          transformedBody = transformRequestBody(anthropicJson, {
+            format: "anthropic",
+            metadataUserId,
+            startPlan,
+            provider: target.provider,
+          }) ?? anthropicJson;
+          upstreamHeaders = buildUpstreamHeaderPairs(clientReq, upstreamFormat, cred, opts.config.identity, plan, undefined, undefined);
+          upstreamReq = buildUpstreamRequest(clientReq, upstreamFormat, providerDef, cred, transformedBody, opts.config.identity, plan, undefined, undefined);
+          return dispatch(upstreamHeaders);
+        },
+      });
+      if (outcome.exhausted) {
+        const tried = outcome.exhausted.tried.join(", ");
+        appendErrorLog({ kind: "fleet_exhausted", reqId: "[responses]", message: `fleet exhausted: ${tried}`, ...traceFields });
+        appendUsage({
+          reqId: "[responses]", format: "OAI", model: req.model, plan,
+          ...(servingAccount ? { account: servingAccount } : {}), ...(tool ? { tool } : {}), ...keyFields,
+          stream, status: 429, tokens: 0, ttfbMs: headersAt - start, totalMs: Date.now() - start,
+        });
+        return errorResponse(429, "fleet_quota_exhausted", `the upstream rejected the request on every account/plan in the fleet (${tried})`);
+      }
+      if (outcome.served) {
+        entry = outcome.served.entry;
+        plan = entry.plan;
+        startPlan = plan === "start-plan";
+        servingAccount = entry.label;
+        upstreamResp = outcome.served.resp;
+      }
+    }
+  } else if (opts.config.planAutoSwitch === true) {
     let planRejected = shouldFallbackPlan(upstreamResp.status, plan);
     if (!planRejected && plan === "start-plan" && upstreamResp.status === 200) {
       const sniff = await sniffStartPlanRejection(upstreamResp);
@@ -415,7 +527,10 @@ export async function handleResponses(
   const meta = { customToolNames, namespaceMap, hasToolSearch };
 
   if (stream) {
-    return streamResponse(upstreamResp, { responseId, model: req.model, meta, request: req, input, options: opts });
+    return streamResponse(upstreamResp, { responseId, model: req.model, meta, request: req, input, options: opts, ledger: {
+      startedAt: start, headersAt, plan,
+      ...(servingAccount ? { account: servingAccount } : {}), ...(tool ? { tool } : {}), ...keyFields,
+    } });
   }
 
   const rawChatResp = await upstreamResp.text();
@@ -440,6 +555,14 @@ export async function handleResponses(
 
   if (debug) console.log(`[responses] ← ${responsesResp.status} (${Date.now() - start}ms)`);
 
+  // Usage ledger (batch completion): tokens from the Responses usage block.
+  appendUsage({
+    reqId: "[responses]", format: "OAI", model: req.model, plan,
+    ...(servingAccount ? { account: servingAccount } : {}), ...(tool ? { tool } : {}), ...keyFields,
+    stream: false, status: 200, tokens: responsesResp.usage?.output_tokens ?? 0,
+    ttfbMs: headersAt - start, totalMs: Date.now() - start,
+  });
+
   return new Response(JSON.stringify(responsesResp), {
     status: 200,
     headers: { "content-type": "application/json" },
@@ -457,6 +580,16 @@ interface StreamResponseContext {
   request: ResponsesRequest;
   input: ResponsesInputItem[];
   options: ResponsesHandlerOptions;
+  /** Usage-ledger attribution carried from handleResponses (stream completes async). */
+  ledger: {
+    startedAt: number;
+    headersAt: number;
+    plan?: PlanTier;
+    account?: string;
+    tool?: string;
+    keyId?: string;
+    keyLabel?: string;
+  };
 }
 
 function streamResponse(upstreamResp: Response, context: StreamResponseContext): Response {
@@ -508,6 +641,20 @@ function streamResponse(upstreamResp: Response, context: StreamResponseContext):
         if (finalEvent && context.request.store !== false && context.options.responseStore) {
           context.options.responseStore.set(buildStoredResponse(finalEvent.response, context.input, context.request.instructions));
         }
+        // Usage ledger (stream completion): tokens from the final Responses
+        // usage block; the client saw HTTP 200 regardless of the event kind.
+        appendUsage({
+          reqId: "[responses]", format: "OAI", model: context.model,
+          ...(context.ledger.plan ? { plan: context.ledger.plan } : {}),
+          ...(context.ledger.account ? { account: context.ledger.account } : {}),
+          ...(context.ledger.tool ? { tool: context.ledger.tool } : {}),
+          ...(context.ledger.keyId ? { keyId: context.ledger.keyId } : {}),
+          ...(context.ledger.keyLabel ? { keyLabel: context.ledger.keyLabel } : {}),
+          stream: true, status: 200,
+          tokens: finalEvent?.response.usage?.output_tokens ?? 0,
+          ttfbMs: context.ledger.headersAt - context.ledger.startedAt,
+          totalMs: Date.now() - context.ledger.startedAt,
+        });
         try { controller.close(); } catch {}
       } catch (err) {
         try {
@@ -546,9 +693,9 @@ function extractSseData(frame: string): string | null {
 // Helpers
 // ─────────────────────────────────────────────
 
-function resolveProviderDef(config: ProxyConfig): ProviderDef & { openaiBaseURL: string; anthropicBaseURL: string } {
-  const base = getProvider(config.provider);
-  const endpoints = config.providers[config.provider];
+function resolveProviderDef(config: ProxyConfig, providerId: ProxyConfig["provider"] = config.provider): ProviderDef & { openaiBaseURL: string; anthropicBaseURL: string } {
+  const base = getProvider(providerId);
+  const endpoints = config.providers[providerId];
   return {
     ...base,
     anthropicBaseURL: endpoints.anthropicBase,

@@ -4,7 +4,7 @@
  */
 import { readFileSync, existsSync } from "node:fs";
 import { parse } from "yaml";
-import type { ClientIdentityConfig, PlanSwitchRule, PlanTier, ProxyConfig, ProviderEndpoints, ProxyIdentity, ResponsesConfig, McpConfig, AsyncConfig, EndpointRoutingConfig, ClientSigningConfig, ClaimConfig } from "./types.js";
+import type { ClientIdentityConfig, PlanSwitchRule, PlanTier, ProxyConfig, ProviderEndpoints, ProxyIdentity, ResponsesConfig, McpConfig, AsyncConfig, EndpointRoutingConfig, ClientSigningConfig, ClaimConfig, AccountsConfig, NotificationsConfig } from "./types.js";
 import { DEFAULT_PLAN_PRIORITY, DEFAULT_PLAN_POLL_INTERVAL_SEC, DEFAULT_PLAN_SWITCH_RULES } from "./types.js";
 
 /** Environment variable keys that override YAML values. */
@@ -27,6 +27,12 @@ const ENV = {
   CLAIM_AUTO: "ZCODE_CLAIM_AUTO",
   CLAIM_ORIGIN: "ZCODE_CLAIM_ORIGIN",
   CLAIM_POLL_INTERVAL_SEC: "ZCODE_CLAIM_POLL_INTERVAL_SEC",
+  ACCOUNTS_ENABLED: "ZCODE_ACCOUNTS_ENABLED",
+  ACCOUNTS_STRATEGY: "ZCODE_ACCOUNTS_STRATEGY",
+  ACCOUNTS_POLL_INTERVAL_SEC: "ZCODE_ACCOUNTS_POLL_INTERVAL_SEC",
+  ACCOUNTS_PRESWITCH_MINUTES: "ZCODE_ACCOUNTS_PRESWITCH_MINUTES",
+  NOTIFY_WEBHOOK: "ZCODE_NOTIFY_WEBHOOK",
+  NOTIFY_NTFY: "ZCODE_NOTIFY_NTFY",
   ENDPOINT_ROUTING_ENABLED: "ZCODE_ENDPOINT_ROUTING",
   CLIENT_SIGNING_ENABLED: "ZCODE_CLIENT_SIGNING",
   MCP_GATEWAY_ENABLED: "ZCODE_MCP_GATEWAY",
@@ -85,6 +91,11 @@ const DEFAULTS = {
   CLAIM_POLL_INTERVAL_SEC: 300,
   CLAIM_COOLDOWN_MS: 600000,
   CLAIM_PLAN_ID: "",
+  ACCOUNTS_ENABLED: false,
+  ACCOUNTS_STRATEGY: "priority" as const,
+  ACCOUNTS_POLL_INTERVAL_SEC: 60,
+  ACCOUNTS_PRESWITCH_MINUTES: 0,
+  NOTIFY_COOLDOWN_SEC: 300,
   ENDPOINT_ROUTING_ENABLED: true,
   ENDPOINT_ROUTING_ORIGIN: "https://zcode.z.ai",
   CLIENT_SIGNING_ENABLED: true,
@@ -162,6 +173,8 @@ export function loadConfig(path: string): ProxyConfig {
   const claimCfg = resolveClaimConfig(parsed?.claim);
   const endpointRouting = resolveEndpointRoutingConfig(parsed?.endpointRouting);
   const clientSigning = resolveClientSigningConfig(parsed?.clientSigning);
+  const accountsCfg = resolveAccountsConfig(parsed?.accounts);
+  const notificationsCfg = resolveNotificationsConfig(parsed?.notifications);
 
   const config: ProxyConfig = {
     server: { port, host },
@@ -184,6 +197,8 @@ export function loadConfig(path: string): ProxyConfig {
     mcp,
     async: asyncCfg,
     claim: claimCfg,
+    accounts: accountsCfg,
+    notifications: notificationsCfg,
     logging: { level: logLevel },
   };
 
@@ -482,9 +497,80 @@ function resolveIdentity(inp: IdentityInputs): ProxyIdentity {
   return { appVersion, sourceTitle, refererOrigin, ...(deviceMid ? { deviceMid } : {}) };
 }
 
-/** Cross-field validation after all fields are resolved. */
-function resolveClaimConfig(raw: unknown): ClaimConfig {
+const ACCOUNT_STRATEGIES: readonly string[] = ["priority", "round-robin", "least-used"];
+
+/**
+ * Resolve the fleet (`accounts:`) section. Mirrors the plan-switch style:
+ * an unrecognized strategy THROWS instead of silently falling back — a silent
+ * strategy fallback would route real spend differently than the config says.
+ */
+function resolveAccountsConfig(raw: unknown): AccountsConfig {
   const obj = raw && typeof raw === "object" ? raw as Record<string, unknown> : {};
+  const enabledEnv = process.env[ENV.ACCOUNTS_ENABLED];
+  const strategyEnv = process.env[ENV.ACCOUNTS_STRATEGY];
+  const strategyRaw = (strategyEnv ?? obj.strategy) as unknown;
+  if (strategyRaw !== undefined && strategyRaw !== null && !ACCOUNT_STRATEGIES.includes(String(strategyRaw))) {
+    throw new Error(`Invalid accounts.strategy "${String(strategyRaw)}": must be one of ${ACCOUNT_STRATEGIES.join(", ")}`);
+  }
+  const preswitchRaw = process.env[ENV.ACCOUNTS_PRESWITCH_MINUTES] ?? obj.preSwitchMinutes;
+  const preswitch = preswitchRaw === undefined || preswitchRaw === null
+    ? DEFAULTS.ACCOUNTS_PRESWITCH_MINUTES
+    : resolveNonNegativeInt(preswitchRaw, DEFAULTS.ACCOUNTS_PRESWITCH_MINUTES, "accounts.preSwitchMinutes");
+  return {
+    enabled: enabledEnv !== undefined ? resolveBool(enabledEnv, DEFAULTS.ACCOUNTS_ENABLED) : resolveBool(obj.enabled, DEFAULTS.ACCOUNTS_ENABLED),
+    strategy: (strategyRaw === undefined || strategyRaw === null ? DEFAULTS.ACCOUNTS_STRATEGY : String(strategyRaw)) as AccountsConfig["strategy"],
+    pollIntervalSec: resolvePositiveInt(
+      process.env[ENV.ACCOUNTS_POLL_INTERVAL_SEC] ?? obj.pollIntervalSec,
+      DEFAULTS.ACCOUNTS_POLL_INTERVAL_SEC,
+      "accounts.pollIntervalSec",
+    ),
+    preSwitchMinutes: preswitch,
+  };
+}
+
+/**
+ * Sink URLs are looser than API origins: paths are the norm (`ntfy.sh/<topic>`,
+ * webhook endpoints), queries happen. Rules: http(s) only, a host, no
+ * userinfo/fragment — enough to stop `file:` surprises without rejecting
+ * legitimate receivers.
+ */
+function validateSinkUrl(raw: string, name: string): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    throw new Error(`${name} "${raw}" is not a valid URL`);
+  }
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+    throw new Error(`${name} must use http: or https: scheme (got ${parsed.protocol})`);
+  }
+  if (!parsed.hostname) {
+    throw new Error(`${name} must include a host`);
+  }
+  if (parsed.username || parsed.password) {
+    throw new Error(`${name} must not contain userinfo`);
+  }
+  if (parsed.hash) {
+    throw new Error(`${name} must not contain a fragment`);
+  }
+  return raw;
+}
+
+function resolveNotificationsConfig(raw: unknown): NotificationsConfig {
+  const obj = raw && typeof raw === "object" ? raw as Record<string, unknown> : {};
+  const webhookRaw = process.env[ENV.NOTIFY_WEBHOOK] ?? obj.webhook;
+  const ntfyRaw = process.env[ENV.NOTIFY_NTFY] ?? obj.ntfy;
+  const webhook = typeof webhookRaw === "string" && webhookRaw.trim() !== "" ? validateSinkUrl(webhookRaw.trim(), "notifications.webhook") : undefined;
+  const ntfy = typeof ntfyRaw === "string" && ntfyRaw.trim() !== "" ? validateSinkUrl(ntfyRaw.trim(), "notifications.ntfy") : undefined;
+  return {
+    ...(webhook !== undefined ? { webhook } : {}),
+    ...(ntfy !== undefined ? { ntfy } : {}),
+    cooldownSec: resolveNonNegativeInt(obj.cooldownSec, DEFAULTS.NOTIFY_COOLDOWN_SEC, "notifications.cooldownSec"),
+  };
+}
+
+/** Cross-field validation after all fields are resolved. */
+function resolveClaimConfig(raw: unknown): ClaimConfig {  const obj = raw && typeof raw === "object" ? raw as Record<string, unknown> : {};
   const enabledEnv = process.env[ENV.CLAIM_ENABLED];
   const autoEnv = process.env[ENV.CLAIM_AUTO];
   const originEnv = process.env[ENV.CLAIM_ORIGIN];

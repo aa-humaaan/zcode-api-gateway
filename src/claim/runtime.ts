@@ -10,24 +10,57 @@ import { createClaimClient, ClaimPreviewError } from "./client.js";
 import { ClaimScheduler } from "./scheduler.js";
 import { getCaptchaToken } from "../proxy/captcha.js";
 import { loadCredential } from "../auth/store.js";
+import { loadAccounts } from "../accounts/store.js";
+import { notify } from "../notify/notify.js";
 
 /** `${process.platform}-${process.arch}` — mirrors the client's `TH()`. */
 export function claimPlatform(): string {
   return `${process.platform}-${process.arch}`;
 }
 
-export function startAutoClaim(config: ProxyConfig, auth: AuthManager): ClaimScheduler {
-  const scheduler = new ClaimScheduler({
-    // AuthManager first (fresh), then the encrypted store — the login can
-    // land in the store after boot while auth hasn't been reloaded.
-    getJwt: async () => {
-      try {
-        const cred = await auth.getCredential();
-        if (cred.jwt) return cred.jwt;
-      } catch { /* fall through to the store */ }
-      const stored = await loadCredential().catch(() => null);
-      return stored?.jwt;
+export function startAutoClaim(config: ProxyConfig, auth: AuthManager): { stop(): void } {
+  if (config.accounts?.enabled !== true) {
+    return startAutoClaimSingle(config, auth);
+  }
+
+  // Fleet mode: one scheduler per enabled account that holds a plan JWT —
+  // every account gets the trial-claim attempt, not just the active one.
+  // Each getJwt re-reads the store so a re-login (fresh JWT) is picked up on
+  // the next poll; accounts without a JWT at start are skipped (the claim
+  // gateway is JWT-only and the scheduler stops itself on login_required).
+  // A fleet change (add/remove account) applies on the next claim-config
+  // hot-reload or process restart.
+  let stopped = false;
+  const schedulers: ClaimScheduler[] = [];
+  void (async () => {
+    const accounts = await loadAccounts().catch(() => []);
+    for (const acc of accounts.filter((a) => a.enabled && a.credential.jwt)) {
+      if (stopped) return;
+      schedulers.push(
+        buildClaimScheduler(config, async () => {
+          // Fresh read per poll: re-logins refresh the JWT in place.
+          const fresh = await loadAccounts().catch(() => []);
+          return fresh.find((a) => a.id === acc.id)?.credential.jwt;
+        }, `[claim:${acc.label}] `),
+      );
+    }
+  })();
+  return {
+    stop: () => {
+      stopped = true;
+      for (const s of schedulers) s.stop();
     },
+  };
+}
+
+/** Shared scheduler construction: one gateway client per account, one log prefix. */
+function buildClaimScheduler(
+  config: ProxyConfig,
+  getJwt: () => Promise<string | undefined>,
+  logPrefix: string,
+): ClaimScheduler {
+  const scheduler = new ClaimScheduler({
+    getJwt,
     createClient: (jwt) =>
       createClaimClient({
         origin: config.claim.origin,
@@ -45,10 +78,25 @@ export function startAutoClaim(config: ProxyConfig, auth: AuthManager): ClaimSch
       pollIntervalMs: config.claim.pollIntervalSec * 1000,
       cooldownMs: config.claim.cooldownMs,
     },
-    log: (message) => console.log(`[claim] ${message}`),
+    log: (message) => console.log(`${logPrefix}${message}`),
+    onEvent: (kind, _planId, message) => {
+      if (kind === "claimed") notify("claim", `${logPrefix}${message}`);
+    },
   });
   scheduler.start();
   return scheduler;
+}
+
+/** Single-account claim (fleet off): AuthManager first, then the store. */
+function startAutoClaimSingle(config: ProxyConfig, auth: AuthManager): ClaimScheduler {
+  return buildClaimScheduler(config, async () => {
+    try {
+      const cred = await auth.getCredential();
+      if (cred.jwt) return cred.jwt;
+    } catch { /* fall through to the store */ }
+    const stored = await loadCredential().catch(() => null);
+    return stored?.jwt;
+  }, "[claim] ");
 }
 
 const FAILURE_LABELS: Record<string, string> = {
