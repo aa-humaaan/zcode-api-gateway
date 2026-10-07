@@ -9,9 +9,8 @@ import { startServer, type ProxyServer } from "./server/server.js";
 import { collectQuotaSnapshot } from "./server/routes-quota.js";
 import { loadCredential, clearCredential, getStorePath } from "./auth/store.js";
 import { AccountManager } from "./accounts/manager.js";
-import { getAccountsStorePath } from "./accounts/store.js";
+import { getAccountsStorePath, setPinnedAccount, getPinnedAccountId, loadAccounts } from "./accounts/store.js";
 import { createFleetRouter, syncFleet, fleetSnapshot, type FleetRouter } from "./accounts/router.js";
-import { loadAccounts } from "./accounts/store.js";
 import { addKey, listKeys, removeKey, setKeyDisabled, getKeysStorePath } from "./keys/keys.js";
 import { readUsageDays, summarizeUsage, usageLogPath } from "./ledger/ledger.js";
 import { configureNotify } from "./notify/notify.js";
@@ -166,6 +165,9 @@ Usage:
   zcode-proxy auth logout           Log out of the ACTIVE account (next takes over)
   zcode-proxy auth status           Show current authentication state
   zcode-proxy accounts list         List accounts (order = serving priority)
+  zcode-proxy accounts select <label>
+                                    Pin one account (serve it while it has quota)
+  zcode-proxy accounts auto         Release the pin, back to strategy
   zcode-proxy accounts remove <label>
   zcode-proxy accounts enable|disable <label>
   zcode-proxy accounts rename <old> <new>
@@ -356,8 +358,18 @@ export async function startServePanel(
       return fleetSnapshot(config);
     },
     onAccountsMutate: async (op, ref) => {
+      // Pin ops (PLAN §9.2): persist in the store, then re-sync so pickServing
+      // honors the pin on the very next request.
+      if (op === "select" || op === "auto") {
+        const pinResult = setPinnedAccount(op === "select" ? ref! : null);
+        if (!pinResult.ok) return { ok: false, error: pinResult.error ?? "unknown" };
+        if (fleet) await fleet.sync();
+        else syncFleet(await loadAccounts().catch(() => []), await getPinnedAccountId());
+        console.log(op === "select" ? `panel: pinned "${pinResult.label}"` : "panel: pin released (auto)");
+        return { ok: true };
+      }
       const manager = new AccountManager();
-      const result = await manager.setEnabled(ref, op === "enable");
+      const result = await manager.setEnabled(ref!, op === "enable");
       if (!result.ok) return { ok: false, error: result.error ?? "unknown" };
       // Immediate effect: the router picks up the new enabled flags on its
       // next pickServing instead of waiting for the watcher tick.
@@ -873,13 +885,38 @@ async function accountsCommand(args: string[]): Promise<void> {
     return;
   }
 
+  if (sub === "select") {
+    // Manual pin (PLAN §9.2): serve THIS account while it is usable,
+    // regardless of strategy. Persisted in the store so the running gateway
+    // picks it up on its next store re-sync.
+    if (!labelArg) {
+      console.error("Usage: zcode-proxy accounts select <label>   (accounts auto → back to strategy)");
+      process.exit(1);
+    }
+    const result = setPinnedAccount(labelArg);
+    if (!result.ok) {
+      console.error(`accounts: ${result.error}`);
+      process.exit(1);
+    }
+    console.log(`Pinned "${result.label}" — requests serve from it while it has quota (accounts auto to release).`);
+    await printAccountList(manager);
+    return;
+  }
+
+  if (sub === "auto") {
+    setPinnedAccount(null);
+    console.log("Pin released — the strategy decides the serving account again.");
+    await printAccountList(manager);
+    return;
+  }
+
   if (sub === "remove" || sub === "enable" || sub === "disable" || sub === "rename") {
     if (!labelArg || (sub === "rename" && !args[2])) {
       console.error(`Usage: zcode-proxy accounts ${sub} ${sub === "rename" ? "<old-label> <new-label>" : "<label>"}`);
       process.exit(1);
     }
   } else {
-    console.error("Usage: zcode-proxy accounts <list|remove|enable|disable|rename>");
+    console.error("Usage: zcode-proxy accounts <list|select|auto|remove|enable|disable|rename>");
     process.exit(1);
   }
 
@@ -912,9 +949,14 @@ async function printAccountList(manager: AccountManager): Promise<void> {
     return;
   }
   const active = await manager.getActive();
+  const pinnedId = getPinnedAccountId();
   console.log(`Accounts (order = serving priority, ${accounts.length} total):`);
   for (const a of accounts) {
-    const marker = active && a.id === active.id ? " (active)" : "";
+    const markers = [
+      active && a.id === active.id ? "active" : null,
+      a.id === pinnedId ? "pinned" : null,
+    ].filter(Boolean) as string[];
+    const marker = markers.length > 0 ? ` (${markers.join(", ")})` : "";
     const state = a.enabled ? "" : " [disabled]";
     console.log(`  ${a.label}${state}${marker} — ${a.provider}, key ${a.credential.apiKey.slice(0, 8)}…`);
   }

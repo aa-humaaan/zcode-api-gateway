@@ -507,7 +507,79 @@ accounts.
 
 ---
 
-## 9. Decision points (where I want your tweaks)
+## 9. Feature plan — Manual account pinning + absolute remaining floor
+
+> Status: **LANDED (2026-10-07)** — pinning (store/router/CLI/panel/TUI) + the
+> minRemaining floor shipped, 1218 tests green, live smoke verified. The
+> operator wants to switch accounts by hand and a hard token floor ("if less
+> than 200 tokens, move on") on top of the §3.3 time-projection.
+
+### 9.1 Diagnosis first (live ledger, 2026-10-07)
+
+The ledger DOES count Claude Code (`claude-cli/2.1.292` rows, served across
+zai / zai-2 / zai-3, streaming + batch). What was missing:
+1. **Key attribution** — Claude Code presented no virtual key → rows landed
+   under `(admin/open)`; fix = issue a `claude-code` key + restart the gateway
+   (the running TUI predates the auth gate).
+2. The ledger lives at `~/.zcode-proxy/usage.log` (default resolution —
+   `ZCODE_PROXY_CONFIG` is not set when running from the repo dir).
+
+### 9.2 Manual account pinning
+
+A **pinned account** overrides the strategy: the router serves the pinned
+account while it is usable, regardless of `strategy`. Design:
+
+- **Store**: `accounts.json` gains a top-level `pinnedId` — the pin survives
+  restarts and crosses processes (CLI ↔ running gateway), picked up on the
+  next watcher tick or panel poll (both re-sync from the store).
+- **Router**: `pickServing` tries the pinned account's first usable entry
+  first; falls back to the normal strategy when the pinned account is
+  disabled/exhausted (never 429 a live fleet because of a stale pin).
+  Removing the pinned account clears the pin.
+- **CLI**: `accounts select <label>` / `accounts auto` (back to strategy).
+- **Panel**: a `Use` button per account row + `Auto` button (new ops
+  `select`/`auto` on `accountsMutate`); the Fleet card shows the pin.
+- **TUI**: clicking an account's NAME pins it (clicking `[disable]` still
+  toggles); a `pinned` marker shows in the row.
+
+### 9.3 Absolute remaining floor (`accounts.minRemaining`)
+
+The §3.3 pre-switch triggers on a TIME projection (slope over ≥5 min), which
+never fires for slowly-draining big buckets. Add a second, direct trigger:
+
+```yaml
+accounts:
+  minRemaining: 200   # units; 0 (default) = off
+```
+
+- The watcher stores each plane's ABSOLUTE remaining (balance buckets in
+  tokens; coding windows in upstream `remaining` units) next to the ratio.
+- Pre-switch activates when EITHER the time projection OR the floor trips:
+  a usable plane reporting `remaining < minRemaining` steers steady-state
+  traffic to the next account (the low account stays a failover target).
+- Units are per-plane and documented as upstream-reported (tokens for the
+  trial bucket; window units for coding planes) — the operator picks a floor
+  that makes sense for their plan mix.
+
+### 9.4 Tests
+
+| Test | Asserts |
+|---|---|
+| store: pin roundtrip + `auto` clears + removing pinned account clears | pin survives save cycles |
+| router: pinned account serves despite priority order; stale pin falls back | strategy parity |
+| watcher/applyPreSwitch: floor triggers below minRemaining; ratio-only data still works | two independent triggers |
+| control: `accountsMutate select/auto` | new ops wired |
+
+### 9.5 Exit test
+
+`accounts select zai-2` → opencode + Claude Code traffic serves from zai-2
+while it has quota, even though zai is first in priority; the panel shows the
+pin; `accounts auto` restores strategy order. An account under the floor
+stops receiving new traffic BEFORE it 429s.
+
+---
+
+## 10. Decision points (where I want your tweaks)
 
 1. **Name & identity.** Repo says `zcode-api-gateway`. Binary/package name,
    TUI branding — pick something ownable or keep this. (Needs deciding by
@@ -521,7 +593,7 @@ accounts.
 5. **One thing I won't compromise on:** keeping single-account behavior
    perfect. It's the upgrade path for every existing user of the fork.
 
-## 10. Risks & honesty corner
+## 11. Risks & honesty corner
 
 - **Multi-account vs. vendor ToS.** Running several *own* accounts through one
   local client is a gray zone with any vendor. This stays a local tool for
@@ -535,7 +607,7 @@ accounts.
   protocol-touching files (`oauth.ts`, `resolver.ts`, signing) get minimal
   changes so merges stay boring.
 
-## 11. Build order & rough effort
+## 12. Build order & rough effort
 
 | # | Deliverable | Size |
 |---|---|---|

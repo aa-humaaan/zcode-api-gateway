@@ -39,6 +39,18 @@ interface AccountRecord {
   encrypted: string;
 }
 
+interface AccountsFile {
+  version: number;
+  accounts: AccountRecord[];
+  /**
+   * The PINNED account (manual "use this one" override, PLAN §9.2): the
+   * router serves it while it is usable, regardless of strategy. Persisted
+   * so the CLI can pin from another process and the pin survives restarts.
+   * Null/absent = strategy decides.
+   */
+  pinnedId?: string | null;
+}
+
 /** Decrypted in-memory view of one account. */
 export interface Account {
   id: string;
@@ -99,9 +111,53 @@ function readRecords(): AccountRecord[] {
   }
 }
 
-function writeRecords(records: AccountRecord[]): void {
+function writeRecords(records: AccountRecord[], pinnedId?: string | null): void {
   mkdirSync(dirname(getAccountsStorePath()), { recursive: true });
-  atomicWriteStore(JSON.stringify({ version: 1, accounts: records }, null, 2));
+  const file: AccountsFile = { version: 1, accounts: records };
+  if (pinnedId !== undefined) file.pinnedId = pinnedId;
+  else {
+    // Preserve an existing pin unless the caller explicitly changed it.
+    const existing = readPinnedIdRaw();
+    if (existing) file.pinnedId = existing;
+  }
+  atomicWriteStore(JSON.stringify(file, null, 2));
+}
+
+/** Raw pinned id from disk (no validation); null when absent. */
+function readPinnedIdRaw(): string | null {
+  try {
+    const parsed = JSON.parse(readFileSync(getAccountsStorePath(), "utf-8")) as Partial<AccountsFile>;
+    return typeof parsed.pinnedId === "string" && parsed.pinnedId ? parsed.pinnedId : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The pinned account id (manual override), validated against the store:
+ * a pin naming a removed account reads as no pin. Null = strategy decides.
+ */
+export function getPinnedAccountId(): string | null {
+  const pin = readPinnedIdRaw();
+  if (!pin) return null;
+  return readRecords().some((r) => r.id === pin) ? pin : null;
+}
+
+/**
+ * Pin an account by label or id (manual "use this one"), or clear the pin
+ * with `null` (`accounts auto`). Unknown refs fail with a reason.
+ */
+export function setPinnedAccount(ref: string | null): { ok: boolean; error?: string; label?: string } {
+  const records = readRecords();
+  if (ref === null) {
+    writeRecords(records, null);
+    return { ok: true };
+  }
+  const lower = ref.toLowerCase();
+  const match = records.find((r) => r.label.toLowerCase() === lower || r.id === ref);
+  if (!match) return { ok: false, error: `no account named "${ref}"` };
+  writeRecords(records, match.id);
+  return { ok: true, label: match.label };
 }
 
 async function decryptRecord(rec: AccountRecord): Promise<Account | null> {
@@ -238,13 +294,13 @@ export interface MutateResult {
   total: number;
 }
 
-/** Remove one account by label or id. */
+/** Remove one account by label or id. Clearing its pin if it was pinned. */
 export async function removeAccount(ref: string): Promise<MutateResult> {
   const records = readRecords();
   const at = findByRef(records, ref);
   if (at < 0) return { ok: false, error: `no account named "${ref}"`, total: records.length };
   const [removed] = records.splice(at, 1);
-  writeRecords(records);
+  writeRecords(records, readPinnedIdRaw() === removed!.id ? null : undefined);
   const account = await decryptRecord(removed!);
   return { ok: true, account: account ?? undefined, total: records.length };
 }
@@ -259,7 +315,7 @@ export async function removeActiveAccount(): Promise<MutateResult> {
   const at = records.findIndex((r) => r.enabled !== false);
   if (at < 0) return { ok: false, error: "no enabled account", total: records.length };
   const [removed] = records.splice(at, 1);
-  writeRecords(records);
+  writeRecords(records, readPinnedIdRaw() === removed!.id ? null : undefined);
   const account = await decryptRecord(removed!);
   return { ok: true, account: account ?? undefined, total: records.length };
 }

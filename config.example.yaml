@@ -67,6 +67,9 @@ planAutoSwitch: false
 #   # Pre-switch (0 = off): steer new traffic off an account projected to run
 #   # out within this many minutes (burn-rate slope), BEFORE the hard 429.
 #   preSwitchMinutes: 0
+#   # Absolute floor (0 = off): move on when a usable account reports fewer
+#   # remaining units than this (trial tokens / coding-window units).
+#   minRemaining: 0
 
 # Local event notifications (both sinks opt-in; events deduped per kind).
 # Env overrides: ZCODE_NOTIFY_WEBHOOK / ZCODE_NOTIFY_NTFY

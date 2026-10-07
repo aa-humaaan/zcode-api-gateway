@@ -80,6 +80,10 @@ planAutoSwitch: false
 #   # minutes (burn-rate slope over recent probes), new traffic steers to the
 #   # next account BEFORE the hard 429. Try 10.
 #   preSwitchMinutes: 0
+#   # Absolute floor (0 = off): when a usable account reports FEWER remaining
+#   # units than this on a plane (trial tokens / coding-window units), new
+#   # traffic moves to the next account immediately. Either trigger works alone.
+#   minRemaining: 0
 
 # Local event notifications (both sinks opt-in; events deduped per kind).
 # Env overrides: ZCODE_NOTIFY_WEBHOOK / ZCODE_NOTIFY_NTFY

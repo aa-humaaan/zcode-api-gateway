@@ -31,6 +31,7 @@ const ENV = {
   ACCOUNTS_STRATEGY: "ZCODE_ACCOUNTS_STRATEGY",
   ACCOUNTS_POLL_INTERVAL_SEC: "ZCODE_ACCOUNTS_POLL_INTERVAL_SEC",
   ACCOUNTS_PRESWITCH_MINUTES: "ZCODE_ACCOUNTS_PRESWITCH_MINUTES",
+  ACCOUNTS_MIN_REMAINING: "ZCODE_ACCOUNTS_MIN_REMAINING",
   NOTIFY_WEBHOOK: "ZCODE_NOTIFY_WEBHOOK",
   NOTIFY_NTFY: "ZCODE_NOTIFY_NTFY",
   PANEL_ENABLED: "ZCODE_PANEL_ENABLED",
@@ -98,6 +99,7 @@ const DEFAULTS = {
   ACCOUNTS_STRATEGY: "priority" as const,
   ACCOUNTS_POLL_INTERVAL_SEC: 60,
   ACCOUNTS_PRESWITCH_MINUTES: 0,
+  ACCOUNTS_MIN_REMAINING: 0,
   NOTIFY_COOLDOWN_SEC: 300,
   PANEL_ENABLED: false,
   PANEL_PORT: 8090,
@@ -523,6 +525,10 @@ function resolveAccountsConfig(raw: unknown): AccountsConfig {
   const preswitch = preswitchRaw === undefined || preswitchRaw === null
     ? DEFAULTS.ACCOUNTS_PRESWITCH_MINUTES
     : resolveNonNegativeInt(preswitchRaw, DEFAULTS.ACCOUNTS_PRESWITCH_MINUTES, "accounts.preSwitchMinutes");
+  const minRemainingRaw = process.env[ENV.ACCOUNTS_MIN_REMAINING] ?? obj.minRemaining;
+  const minRemaining = minRemainingRaw === undefined || minRemainingRaw === null
+    ? DEFAULTS.ACCOUNTS_MIN_REMAINING
+    : resolveNonNegativeInt(minRemainingRaw, DEFAULTS.ACCOUNTS_MIN_REMAINING, "accounts.minRemaining");
   return {
     enabled: enabledEnv !== undefined ? resolveBool(enabledEnv, DEFAULTS.ACCOUNTS_ENABLED) : resolveBool(obj.enabled, DEFAULTS.ACCOUNTS_ENABLED),
     strategy: (strategyRaw === undefined || strategyRaw === null ? DEFAULTS.ACCOUNTS_STRATEGY : String(strategyRaw)) as AccountsConfig["strategy"],
@@ -532,6 +538,7 @@ function resolveAccountsConfig(raw: unknown): AccountsConfig {
       "accounts.pollIntervalSec",
     ),
     preSwitchMinutes: preswitch,
+    minRemaining,
   };
 }
 

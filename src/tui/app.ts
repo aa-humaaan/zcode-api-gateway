@@ -29,7 +29,7 @@ import { watchConfigFile, type ConfigWatcher } from "../config/watch.js";
 import { collectQuotaSnapshot, type QuotaSnapshot } from "../server/routes-quota.js";
 import { activePlan } from "../plan/auto.js";
 import { createFleetRouter, fleetSnapshot, syncFleet, type FleetRouter, type FleetSnapshot } from "../accounts/router.js";
-import { setAccountEnabled, loadAccounts } from "../accounts/store.js";
+import { setAccountEnabled, setPinnedAccount, getPinnedAccountId, loadAccounts } from "../accounts/store.js";
 import { configureNotify } from "../notify/notify.js";
 import { appendFileSync } from "node:fs";
 import type { ProxyConfig } from "../config/types.js";
@@ -346,8 +346,8 @@ export async function runTui(args: ServeArgs): Promise<void> {
   async function refreshFleet(): Promise<void> {
     try {
       // Re-sync the router's snapshot from the store first so the card shows
-      // accounts even before the fleet watcher's first probe lands.
-      syncFleet(await loadAccounts());
+      // accounts (and the current pin) even before the watcher's first probe.
+      syncFleet(await loadAccounts(), await getPinnedAccountId());
       state.fleet = fleetSnapshot(config);
     } catch {
       state.fleet = null;
@@ -365,6 +365,20 @@ export async function runTui(args: ServeArgs): Promise<void> {
       setToast(`account "${account.label}" ${next ? "enabled" : "disabled (serving skipped)"}`, "ok");
     } else {
       setToast(`account toggle failed: ${result.error ?? "unknown"}`, "err");
+    }
+    await refreshFleet();
+  }
+
+  /** Click the account NAME to pin/unpin it (PLAN §9.2) — manual serving override. */
+  async function pinAccount(accountId: string): Promise<void> {
+    const account = state.fleet?.accounts.find((a) => a.id === accountId);
+    if (!account) return;
+    const pinning = !account.pinned;
+    const result = setPinnedAccount(pinning ? accountId : null);
+    if (result.ok) {
+      setToast(pinning ? `pinned "${account.label}" — requests serve from it` : `pin released — strategy decides again`, "ok");
+    } else {
+      setToast(`pin failed: ${result.error ?? "unknown"}`, "err");
     }
     await refreshFleet();
   }
@@ -706,6 +720,9 @@ export async function runTui(args: ServeArgs): Promise<void> {
         return;
       case "account":
         void toggleAccount(action.accountId);
+        return;
+      case "account-pin":
+        void pinAccount(action.accountId);
         return;
     }
   }

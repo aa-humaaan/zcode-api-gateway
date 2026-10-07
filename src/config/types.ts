@@ -229,6 +229,14 @@ export interface AccountsConfig {
    * the current one into a 429. `0` (default) = off — pure reactive failover.
    */
   preSwitchMinutes?: number;
+  /**
+   * Absolute remaining floor (PLAN §9.3): when a usable account reports
+   * fewer remaining units than this on a plane (start-plan tokens; coding
+   * windows in upstream units), new traffic steers to the next account
+   * immediately. Either this OR `preSwitchMinutes` can trigger the steering.
+   * `0` (default) = off.
+   */
+  minRemaining?: number;
 }
 
 /**

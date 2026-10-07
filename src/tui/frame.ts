@@ -21,7 +21,8 @@ export type ClickAction =
   | { kind: "provider"; value: "zai" | "bigmodel" }
   | { kind: "plan"; value: "coding-plan" | "start-plan" }
   | { kind: "follow" }
-  | { kind: "account"; accountId: string };
+  | { kind: "account"; accountId: string }
+  | { kind: "account-pin"; accountId: string };
 
 /** 0-based terminal-cell span carrying an action. */
 export interface ClickRegion {
@@ -586,13 +587,22 @@ export function buildFrame(s: FrameState): Frame {
         chips.push({ t: "  " });
         chips.push({ t: `${planShort(entry.plan)}${entryMark(entry.state)}${pct}`, c: entryColor(entry.state) });
       }
-      const nameSeg: Seg = account.serving
-        ? { t: `${account.label} ●`, c: GREEN }
-        : account.enabled
-          ? { t: account.label, c: CYAN }
-          : { t: account.label, c: DIM };
+      // Clicking the NAME pins/unpins the account (PLAN §9.2); the pin wins
+      // over the strategy while the account can serve.
+      const nameText = account.pinned ? `📌 ${account.label}` : account.label;
+      const nameSeg: Seg = account.pinned
+        ? { t: `${nameText} ●`, c: GREEN }
+        : account.serving
+          ? { t: `${account.label} ●`, c: GREEN }
+          : account.enabled
+            ? { t: account.label, c: CYAN }
+            : { t: account.label, c: DIM };
       const toggleParts: Part[] = [
-        { t: padName(truncateToWidth(nameSeg.t, 12)), c: nameSeg.c },
+        {
+          t: padName(truncateToWidth(nameSeg.t, 14)),
+          c: nameSeg.c,
+          action: { kind: "account-pin", accountId: account.id },
+        },
         { t: ` ${truncateToWidth(account.provider, 8)}`, c: DIM },
         ...chips,
         { t: "  " },
@@ -602,6 +612,7 @@ export function buildFrame(s: FrameState): Frame {
           action: { kind: "account", accountId: account.id },
         },
         ...(account.isActive ? [{ t: " active" as string, c: DIM }] : []),
+        ...(account.preSwitch ? [{ t: " steering" as string, c: AMBER }] : []),
       ];
       const row = composeRow(w, lines.length, "Accounts", toggleParts);
       emit(row.line);

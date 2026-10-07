@@ -36,7 +36,7 @@ export type ControlCommand =
   | { cmd: "getLogs"; since?: number }
   | { cmd: "quota" }
   | { cmd: "accounts" }
-  | { cmd: "accountsMutate"; op: "enable" | "disable"; ref: string }
+  | { cmd: "accountsMutate"; op: "enable" | "disable" | "select" | "auto"; ref?: string }
   | { cmd: "usage"; days?: number }
   | { cmd: "shutdown" };
 
@@ -52,7 +52,7 @@ export type ControlOk =
   | { ok: true; event: "logs"; nextSince: number; lines: string[] }
   | { ok: true; event: "quota"; quota: QuotaSnapshot }
   | { ok: true; event: "accounts"; fleet: FleetSnapshot }
-  | { ok: true; event: "accountUpdated"; op: "enable" | "disable"; ref: string }
+  | { ok: true; event: "accountUpdated"; op: "enable" | "disable" | "select" | "auto"; ref?: string }
   | { ok: true; event: "usage"; usage: UsageSummary }
   | { ok: true; event: "shuttingDown" };
 
@@ -135,8 +135,8 @@ export interface HandlerContext {
   onQuota?: () => Promise<QuotaSnapshot>;
   /** Fleet status for the Accounts card (pure snapshot; no upstream calls). */
   onAccounts?: () => Promise<FleetSnapshot>;
-  /** Enable/disable one account by label or id (fleet manager). */
-  onAccountsMutate?: (op: "enable" | "disable", ref: string) => Promise<{ ok: true } | { ok: false; error: string }>;
+  /** Enable/disable/pin accounts (fleet manager). `select` needs `ref`; `auto` clears the pin. */
+  onAccountsMutate?: (op: "enable" | "disable" | "select" | "auto", ref?: string) => Promise<{ ok: true } | { ok: false; error: string }>;
   /** Local usage aggregates for the panel's Usage card (pure file read). */
   onUsage?: (days: number) => Promise<UsageSummary>;
   logBuffer: LogBuffer;
@@ -313,6 +313,9 @@ async function dispatch(
 
     case "accountsMutate": {
       if (!ctx.onAccountsMutate) return { ok: false, error: "accounts_unavailable" };
+      if ((cmd.op === "enable" || cmd.op === "disable" || cmd.op === "select") && typeof cmd.ref !== "string") {
+        return { ok: false, error: `accountsMutate ${cmd.op} requires ref` };
+      }
       const result = await ctx.onAccountsMutate(cmd.op, cmd.ref);
       if (!result.ok) return result;
       return { ok: true, event: "accountUpdated", op: cmd.op, ref: cmd.ref };

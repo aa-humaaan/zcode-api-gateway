@@ -10,9 +10,11 @@ import {
   pickServing,
   minutesToEmpty,
   applyPreSwitch,
+  fleetSnapshot,
   __resetFleetStateForTests,
   __setUsageForTests,
   __setProbeHistoryForTests,
+  __setCooldownForTests,
 } from "./router.js";
 import type { Account } from "./store.js";
 import type { Credential } from "../auth/types.js";
@@ -116,5 +118,78 @@ describe("pre-switch", () => {
       { r: 0.05, ts: Date.now() },
     ]);
     expect(pickServing(cfg)!.label).toBe("a");
+  });
+});
+
+describe("minRemaining floor (PLAN §9.3)", () => {
+  it("steers away when a usable plane's absolute remaining is below the floor", () => {
+    const accounts = [account({ id: "a", label: "a" }), account({ id: "b", label: "b" })];
+    syncFleet(accounts);
+    const cfg = config({ accounts: { enabled: true, strategy: "priority", pollIntervalSec: 60, preSwitchMinutes: 0, minRemaining: 200 } });
+    __setUsageForTests("a", { coding: { usable: true, probedAt: Date.now(), remainingRatio: 0.9, remainingAbsolute: 150 } });
+    __setUsageForTests("b", { coding: { usable: true, probedAt: Date.now(), remainingRatio: 0.5, remainingAbsolute: 5000 } });
+    applyPreSwitch(cfg, accounts, Date.now());
+    expect(pickServing(cfg)!.label).toBe("b");
+  });
+
+  it("does NOT steer on the floor when remaining is unknown or above it", () => {
+    const accounts = [account({ id: "a", label: "a" }), account({ id: "b", label: "b" })];
+    syncFleet(accounts);
+    const cfg = config({ accounts: { enabled: true, strategy: "priority", pollIntervalSec: 60, preSwitchMinutes: 0, minRemaining: 200 } });
+    __setUsageForTests("a", { coding: { usable: true, probedAt: Date.now(), remainingRatio: 0.9, remainingAbsolute: null } });
+    applyPreSwitch(cfg, accounts, Date.now());
+    expect(pickServing(cfg)!.label).toBe("a"); // unknown ≠ low
+  });
+
+  it("neither trigger configured → never steers", () => {
+    const accounts = [account({ id: "a", label: "a" }), account({ id: "b", label: "b" })];
+    syncFleet(accounts);
+    const cfg = config();
+    __setUsageForTests("a", { coding: { usable: true, probedAt: Date.now(), remainingRatio: 0.9, remainingAbsolute: 5 } });
+    applyPreSwitch(cfg, accounts, Date.now());
+    expect(pickServing(cfg)!.label).toBe("a");
+  });
+});
+
+describe("account pinning (PLAN §9.2)", () => {
+  it("the pinned account serves despite priority order", () => {
+    const accounts = [account({ id: "a", label: "a" }), account({ id: "b", label: "b" })];
+    syncFleet(accounts, accounts[1]!.id); // pin b, priority says a
+    const cfg = config();
+    expect(pickServing(cfg)!.label).toBe("b");
+  });
+
+  it("a stale pin (disabled account) falls back to strategy", () => {
+    const accounts = [account({ id: "a", label: "a" }), account({ id: "b", label: "b", enabled: false })];
+    syncFleet(accounts, accounts[1]!.id);
+    const cfg = config();
+    expect(pickServing(cfg)!.label).toBe("a");
+  });
+
+  it("the pin overrides the pre-switch floor (explicit human intent)", () => {
+    const accounts = [account({ id: "a", label: "a" }), account({ id: "b", label: "b" })];
+    syncFleet(accounts, accounts[0]!.id); // pin a
+    const cfg = config({ accounts: { enabled: true, strategy: "priority", pollIntervalSec: 60, preSwitchMinutes: 0, minRemaining: 200 } });
+    __setUsageForTests("a", { coding: { usable: true, probedAt: Date.now(), remainingRatio: 0.1, remainingAbsolute: 50 } });
+    __setUsageForTests("b", { coding: { usable: true, probedAt: Date.now(), remainingRatio: 0.9, remainingAbsolute: 9000 } });
+    applyPreSwitch(cfg, accounts, Date.now());
+    expect(pickServing(cfg)!.label).toBe("a"); // human pin > automatic floor
+  });
+
+  it("a pin can't serve through a cooldown (falls to strategy until it expires)", () => {
+    const accounts = [account({ id: "a", label: "a" }), account({ id: "b", label: "b" })];
+    syncFleet(accounts, accounts[0]!.id);
+    const cfg = config();
+    for (const entry of fleetChain(cfg).filter((e) => e.accountId === "a")) {
+      __setCooldownForTests(entry, Date.now() + 60_000);
+    }
+    expect(pickServing(cfg)!.label).toBe("b");
+  });
+
+  it("snapshot exposes the pin", () => {
+    const accounts = [account({ id: "a", label: "a" }), account({ id: "b", label: "b" })];
+    syncFleet(accounts, accounts[1]!.id);
+    const snap = fleetSnapshot(config());
+    expect(snap.accounts.map((a) => a.pinned)).toEqual([false, true]);
   });
 });

@@ -42,6 +42,7 @@ import type { Credential } from "../auth/types.js";
 import type { ProxyConfig } from "../config/types.js";
 import {
   loadAccounts,
+  getPinnedAccountId,
   type Account,
 } from "./store.js";
 import {
@@ -67,6 +68,13 @@ interface PlaneUsage {
   probedAt: number;
   /** Remaining quota 0..1 (min across watched windows / max bucket); null when unknown. */
   remainingRatio: number | null;
+  /**
+   * ABSOLUTE remaining in the plane's native units (PLAN §9.3): tokens for
+   * the trial balance bucket, upstream `remaining` for coding windows. The
+   * `accounts.minRemaining` floor reads this, not the ratio. Undefined =
+   * not captured yet (unknown ≠ low).
+   */
+  remainingAbsolute?: number | null;
   /**
    * Recent remaining-ratio readings for the burn-rate projection (oldest
    * first, capped). Cleared when a reading jumps UP (quota reset/refill) —
@@ -95,11 +103,13 @@ interface FleetState {
   cooldowns: Map<string, number>;
   /**
    * Pre-switch: accountId → until epoch ms. Accounts projecting empty within
-   * `accounts.preSwitchMinutes` stop RECEIVING new steady-state traffic (the
-   * strategies skip them) while still serving as failover targets — the next
-   * account takes the load BEFORE the hard 429. Off when config is 0.
+   * `accounts.preSwitchMinutes` — or below `accounts.minRemaining` — stop
+   * RECEIVING new steady-state traffic (the strategies skip them) while still
+   * serving as failover targets. Off when both configs are 0.
    */
   preSwitch: Map<string, number>;
+  /** Pinned account (manual override from the store, PLAN §9.2); null = strategy decides. */
+  pinnedAccountId: string | null;
   /** Round-robin cursor over usable accounts. */
   rrCursor: number;
   /** What pickServing last chose (watcher log line). */
@@ -111,13 +121,15 @@ const state: FleetState = {
   usage: new Map(),
   cooldowns: new Map(),
   preSwitch: new Map(),
+  pinnedAccountId: null,
   rrCursor: 0,
   lastServing: null,
 };
 
 /** Replace the account snapshot (store is the source of truth); runtime state of removed accounts is dropped. */
-export function syncFleet(accounts: Account[]): void {
+export function syncFleet(accounts: Account[], pinnedAccountId: string | null = null): void {
   state.accounts = accounts;
+  state.pinnedAccountId = pinnedAccountId;
   const ids = new Set(accounts.map((a) => a.id));
   for (const id of [...state.usage.keys()]) {
     if (!ids.has(id)) state.usage.delete(id);
@@ -125,6 +137,7 @@ export function syncFleet(accounts: Account[]): void {
   for (const id of [...state.preSwitch.keys()]) {
     if (!ids.has(id)) state.preSwitch.delete(id);
   }
+  if (state.pinnedAccountId && !ids.has(state.pinnedAccountId)) state.pinnedAccountId = null;
 }
 
 /** The failover chain: enabled accounts in store order × plan priority. */
@@ -227,7 +240,7 @@ export function pickServing(config: ProxyConfig): ChainEntry | null {
         ? pickLeastUsed(config, entries)
         : (entries.find((e) => entryUsable(e, config)) ?? null);
   };
-  // Pre-switch first pass: skip accounts projected to empty soon. If that
+  // Pre-switch first pass: skip accounts projected/below-floor. If that
   // leaves nothing (single-account fleet, or every account projecting out),
   // serve anyway — riding the current account into the 429 beats serving
   // nothing, and the per-request walk still fails over.
@@ -236,6 +249,16 @@ export function pickServing(config: ProxyConfig): ChainEntry | null {
     const until = state.preSwitch.get(e.accountId);
     return until === undefined || now >= until;
   };
+  // Manual pin (PLAN §9.2) beats the strategy AND the automatic floor/pre-
+  // switch — explicit human intent — while hard usability (cooldowns after a
+  // fresh upstream rejection) still applies. A stale pin falls through.
+  if (state.pinnedAccountId) {
+    const pinnedEntry = chain.find((e) => e.accountId === state.pinnedAccountId && entryUsable(e, config));
+    if (pinnedEntry) {
+      state.lastServing = pinnedEntry;
+      return pinnedEntry;
+    }
+  }
   const picked = pick(chain.filter(notPreSwitched)) ?? pick(chain);
   if (picked) state.lastServing = picked;
   return picked;
@@ -403,7 +426,8 @@ export interface FleetRouter {
 export function createFleetRouter(config: ProxyConfig, deps: FleetWatcherDeps = {}): FleetRouter {
   return {
     async sync(): Promise<void> {
-      syncFleet(await loadAccounts().catch(() => [] as Account[]));
+      const accounts = await loadAccounts().catch(() => [] as Account[]);
+      syncFleet(accounts, await getPinnedAccountId());
     },
     startWatcher(): FleetWatcher {
       return startFleetWatcher(config, deps);
@@ -440,17 +464,18 @@ function ensureUsage(accountId: string): AccountUsage {
   return usage;
 }
 
-/** Max remaining/total across balance buckets with a sane total. */
-function startRatio(balances: StartPlanBalance["balances"]): number | null {
-  const ratios = balances
-    .filter((b) => b.totalUnits > 0)
-    .map((b) => Math.min(1, Math.max(0, b.remainingUnits / b.totalUnits)));
-  return ratios.length === 0 ? null : Math.max(...ratios);
+/** Max remaining/total across balance buckets with a sane total, plus the absolute best bucket. */
+function startRatio(balances: StartPlanBalance["balances"]): { ratio: number | null; absolute: number | null } {
+  const usable = balances.filter((b) => b.totalUnits > 0);
+  const ratios = usable.map((b) => Math.min(1, Math.max(0, b.remainingUnits / b.totalUnits)));
+  const absolute = balances.reduce((best, b) => Math.max(best, b.remainingUnits), 0);
+  return { ratio: ratios.length === 0 ? null : Math.max(...ratios), absolute };
 }
 
-/** Min remaining ratio across the WATCHED coding windows (the binding constraint). */
-function codingRatio(limits: CodingPlanUsage["limits"], watchTypes: string[]): number | null {
+/** Min remaining across the WATCHED coding windows (the binding constraint), ratio + absolute. */
+function codingRatio(limits: CodingPlanUsage["limits"], watchTypes: string[]): { ratio: number | null; absolute: number | null } {
   const ratios: number[] = [];
+  const absolutes: number[] = [];
   for (const type of watchTypes) {
     const row = limits.find((l) => l.type === type);
     if (!row) continue;
@@ -459,8 +484,12 @@ function codingRatio(limits: CodingPlanUsage["limits"], watchTypes: string[]): n
     } else if (typeof row.remaining === "number" && typeof row.total === "number" && row.total > 0) {
       ratios.push(Math.min(1, Math.max(0, row.remaining / row.total)));
     }
+    if (typeof row.remaining === "number") absolutes.push(row.remaining);
   }
-  return ratios.length === 0 ? null : Math.min(...ratios);
+  return {
+    ratio: ratios.length === 0 ? null : Math.min(...ratios),
+    absolute: absolutes.length === 0 ? null : Math.min(...absolutes),
+  };
 }
 
 /** Probe-history cap — old readings beyond this add nothing to the slope. */
@@ -505,10 +534,15 @@ export function minutesToEmpty(usage: AccountUsage | undefined, plane: "start" |
   return Number.isFinite(tte) && tte > 0 ? tte : null;
 }
 
-/** Pre-switch pass: activate/deactivate per account from projections + config. */
+/**
+ * Pre-switch pass (PLAN §9.3): activate/deactivate per account from the time
+ * projection AND the absolute `accounts.minRemaining` floor — either trigger
+ * steers steady-state traffic away while the entry stays a failover target.
+ */
 export function applyPreSwitch(config: ProxyConfig, accounts: Account[], now: number): void {
   const thresholdMin = config.accounts?.preSwitchMinutes ?? 0;
-  if (thresholdMin <= 0) {
+  const floor = config.accounts?.minRemaining ?? 0;
+  if (thresholdMin <= 0 && floor <= 0) {
     state.preSwitch.clear();
     return;
   }
@@ -519,14 +553,32 @@ export function applyPreSwitch(config: ProxyConfig, accounts: Account[], now: nu
     }
     const usage = state.usage.get(account.id);
     const tte = minutesToEmpty(usage, "coding") ?? minutesToEmpty(usage, "start");
+    const timeTrigger = tte !== null && tte <= thresholdMin && thresholdMin > 0;
+    // Floor: the BEST usable plane's absolute remaining below the threshold.
+    // Only planes that reported an absolute count can trip it (unknown ≠ low).
+    let floorTrigger = false;
+    let floorPlane: "start" | "coding" | null = null;
+    let floorValue: number | null = null;
+    if (floor > 0 && usage !== undefined) {
+      for (const plane of ["start", "coding"] as const) {
+        const p = usage[plane];
+        if (p.usable !== true || p.remainingAbsolute == null) continue;
+        if (p.remainingAbsolute < floor) {
+          floorTrigger = true;
+          floorPlane = plane;
+          floorValue = p.remainingAbsolute;
+          break;
+        }
+      }
+    }
     const wasActive = state.preSwitch.has(account.id);
-    if (tte !== null && tte <= thresholdMin) {
-      state.preSwitch.set(account.id, now + Math.max(1, Math.round(tte)) * 60_000);
+    if (timeTrigger || floorTrigger) {
+      state.preSwitch.set(account.id, now + Math.max(1, Math.round(timeTrigger ? tte! : 5)) * 60_000);
       if (!wasActive) {
-        notify(
-          "pre_switch",
-          `fleet: "${account.label}" projects empty in ~${formatDuration(tte * 60_000)} at current burn — steering new traffic to the next account`,
-        );
+        const why = floorTrigger
+          ? `${floorPlane === "start" ? "start-plan tokens" : "coding-plan windows"} at ${floorValue} left (floor ${floor})`
+          : `projects empty in ~${formatDuration(tte! * 60_000)} at current burn`;
+        notify("pre_switch", `fleet: "${account.label}" ${why} — steering new traffic to the next account`);
       }
     } else {
       state.preSwitch.delete(account.id);
@@ -559,7 +611,7 @@ export function startFleetWatcher(config: ProxyConfig, deps: FleetWatcherDeps = 
     async tick(): Promise<void> {
       if (stopped) return;
       const accounts = (await loadAccountsImpl().catch(() => [])) as Account[];
-      syncFleet(accounts);
+      syncFleet(accounts, await getPinnedAccountId());
       const enabled = accounts.filter((a) => a.enabled);
 
       for (let i = 0; i < enabled.length; i++) {
@@ -579,11 +631,12 @@ export function startFleetWatcher(config: ProxyConfig, deps: FleetWatcherDeps = 
         if (start !== null) {
           if (start.ok) {
             const wasUsable = usage.start.usable;
-            const ratio = startRatio(start.balances);
+            const { ratio, absolute } = startRatio(start.balances);
             usage.start = {
               usable: hasUsableBalance(start.balances),
               probedAt: now,
               remainingRatio: ratio,
+              remainingAbsolute: absolute,
             };
             recordBurnReading(usage, "start", ratio, now);
             usage.startProbe = start;
@@ -600,11 +653,12 @@ export function startFleetWatcher(config: ProxyConfig, deps: FleetWatcherDeps = 
         if (coding !== null) {
           if (coding.ok) {
             const wasUsable = usage.coding.usable;
-            const ratio = codingRatio(coding.limits, planWatchedLimitsOf(config, "coding-plan"));
+            const { ratio, absolute } = codingRatio(coding.limits, planWatchedLimitsOf(config, "coding-plan"));
             usage.coding = {
               usable: codingUsable(coding.limits, planWatchedLimitsOf(config, "coding-plan")),
               probedAt: now,
               remainingRatio: ratio,
+              remainingAbsolute: absolute,
             };
             recordBurnReading(usage, "coding", ratio, now);
             usage.codingProbe = coding;
@@ -697,6 +751,7 @@ export function __resetFleetStateForTests(): void {
   state.usage = new Map();
   state.cooldowns = new Map();
   state.preSwitch = new Map();
+  state.pinnedAccountId = null;
   state.rrCursor = 0;
   state.lastServing = null;
 }
@@ -724,7 +779,9 @@ export interface FleetSnapshotAccount {
   serving: boolean;
   /** First enabled account in store order — the pre-fleet "active". */
   isActive: boolean;
-  /** Projected to run out soon: new steady-state traffic is steering away. */
+  /** Pinned by hand (`accounts select` / panel Use) — overrides strategy. */
+  pinned: boolean;
+  /** Projected/below-floor: new steady-state traffic is steering away. */
   preSwitch: boolean;
   entries: FleetSnapshotEntry[];
 }
@@ -773,6 +830,7 @@ export function fleetSnapshot(config: ProxyConfig): FleetSnapshot {
       enabled: a.enabled,
       serving: state.lastServing?.accountId === a.id,
       isActive: active?.id === a.id,
+      pinned: state.pinnedAccountId === a.id,
       preSwitch: (() => {
         const until = state.preSwitch.get(a.id);
         return until !== undefined && now < until;

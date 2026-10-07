@@ -382,6 +382,7 @@
       const FLEET_PLAN = { "start-plan": "trial", "coding-plan": "coding" };
       function renderFleet(fleet) {
         const parts = [];
+        const anyPinned = (fleet.accounts || []).some((a) => a.pinned);
         for (const account of fleet.accounts || []) {
           const name = account.serving ? "◉ " : account.isActive ? "· " : "&nbsp;&nbsp;";
           const chips = (account.entries || [])
@@ -393,12 +394,16 @@
                 esc(FLEET_MARK[e.state] || "·") + esc(pct) + "</span>";
             })
             .join(" ");
+          const pin = account.pinned
+            ? '<span class="ok">📌 pinned</span> '
+            : '<button data-account="' + esc(account.id) + '" data-op="select">Use</button> ';
           const toggle = '<button data-account="' + esc(account.id) + '" data-op="' +
             (account.enabled ? "disable" : "enable") + '">' + (account.enabled ? "Disable" : "Enable") + "</button>";
           parts.push(
             '<div class="row"><strong>' + name + esc(account.label) + "</strong>" +
-            ' <span class="muted">' + esc(account.provider) + "</span> " + chips + " " + toggle +
-            (account.enabled ? "" : ' <span class="warn">disabled</span>') + "</div>",
+            ' <span class="muted">' + esc(account.provider) + "</span> " + chips + " " + pin + toggle +
+            (account.enabled ? "" : ' <span class="warn">disabled</span>') +
+            (account.preSwitch ? ' <span class="warn">steering away</span>' : "") + "</div>",
           );
         }
         if ((fleet.accounts || []).length === 0) {
@@ -407,6 +412,11 @@
         $("fleet-body").innerHTML = parts.join("") || "No data yet.";
         for (const btn of $("fleet-body").querySelectorAll("button[data-account]")) {
           btn.onclick = () => guard("account", { cmd: "accountsMutate", op: btn.dataset.op, ref: btn.dataset.account });
+        }
+        if (anyPinned) {
+          $("fleet-body").insertAdjacentHTML("beforeend", '<div class="row"><button id="fleet-auto">Auto (release pin)</button></div>');
+          const auto = document.getElementById("fleet-auto");
+          if (auto) auto.onclick = () => guard("account", { cmd: "accountsMutate", op: "auto" });
         }
       }
 

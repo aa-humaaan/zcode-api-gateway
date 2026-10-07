@@ -13,6 +13,8 @@ import {
   removeActiveAccount,
   setAccountEnabled,
   renameAccount,
+  setPinnedAccount,
+  getPinnedAccountId,
   getAccountsStorePath,
 } from "./store.js";
 import { loadCredential, saveCredential, clearCredential, getStorePath } from "../auth/store.js";
@@ -262,5 +264,38 @@ describe("auth/store shim over the accounts store", () => {
     process.env.ZCODE_PROXY_CREDENTIAL_SECRET = saved;
 
     expect(await loadCredential()).toBeNull();
+  });
+});
+
+describe("accounts store — pinning (PLAN §9.2)", () => {
+  let dir: string;
+  beforeEach(() => { dir = useTempStore(); });
+  afterEach(() => dropTempStore(dir));
+
+  it("setPinnedAccount by label → getPinnedAccountId roundtrips; auto clears", async () => {
+    await addAccount(cred("k1"), { label: "work" });
+    await addAccount(cred("k2", { userId: "u2" }), { label: "trial" });
+
+    expect(getPinnedAccountId()).toBeNull();
+    const pin = setPinnedAccount("trial");
+    expect(pin.ok).toBe(true);
+    expect(getPinnedAccountId()).toBe((await loadAccounts()).find((a) => a.label === "trial")!.id);
+
+    setPinnedAccount(null);
+    expect(getPinnedAccountId()).toBeNull();
+  });
+
+  it("a pin naming a removed account reads as no pin", async () => {
+    await addAccount(cred("k1"), { label: "work" });
+    setPinnedAccount("work");
+    await removeAccount("work");
+    expect(getPinnedAccountId()).toBeNull();
+  });
+
+  it("unknown label fails with a reason", async () => {
+    await addAccount(cred("k1"), { label: "work" });
+    const res = setPinnedAccount("nope");
+    expect(res.ok).toBe(false);
+    expect(res.error).toContain("nope");
   });
 });
