@@ -4,7 +4,7 @@
  */
 import { readFileSync, existsSync } from "node:fs";
 import { parse } from "yaml";
-import type { ClientIdentityConfig, PlanSwitchRule, PlanTier, ProxyConfig, ProviderEndpoints, ProxyIdentity, ResponsesConfig, McpConfig, AsyncConfig, EndpointRoutingConfig, ClientSigningConfig, ClaimConfig, AccountsConfig, NotificationsConfig } from "./types.js";
+import type { ClientIdentityConfig, PlanSwitchRule, PlanTier, ProxyConfig, ProviderEndpoints, ProxyIdentity, ResponsesConfig, McpConfig, AsyncConfig, EndpointRoutingConfig, ClientSigningConfig, ClaimConfig, AccountsConfig, NotificationsConfig, PanelConfig } from "./types.js";
 import { DEFAULT_PLAN_PRIORITY, DEFAULT_PLAN_POLL_INTERVAL_SEC, DEFAULT_PLAN_SWITCH_RULES } from "./types.js";
 
 /** Environment variable keys that override YAML values. */
@@ -33,6 +33,9 @@ const ENV = {
   ACCOUNTS_PRESWITCH_MINUTES: "ZCODE_ACCOUNTS_PRESWITCH_MINUTES",
   NOTIFY_WEBHOOK: "ZCODE_NOTIFY_WEBHOOK",
   NOTIFY_NTFY: "ZCODE_NOTIFY_NTFY",
+  PANEL_ENABLED: "ZCODE_PANEL_ENABLED",
+  PANEL_TOKEN: "ZCODE_PANEL_TOKEN",
+  PANEL_PORT: "ZCODE_PANEL_PORT",
   ENDPOINT_ROUTING_ENABLED: "ZCODE_ENDPOINT_ROUTING",
   CLIENT_SIGNING_ENABLED: "ZCODE_CLIENT_SIGNING",
   MCP_GATEWAY_ENABLED: "ZCODE_MCP_GATEWAY",
@@ -96,6 +99,8 @@ const DEFAULTS = {
   ACCOUNTS_POLL_INTERVAL_SEC: 60,
   ACCOUNTS_PRESWITCH_MINUTES: 0,
   NOTIFY_COOLDOWN_SEC: 300,
+  PANEL_ENABLED: false,
+  PANEL_PORT: 8090,
   ENDPOINT_ROUTING_ENABLED: true,
   ENDPOINT_ROUTING_ORIGIN: "https://zcode.z.ai",
   CLIENT_SIGNING_ENABLED: true,
@@ -175,6 +180,7 @@ export function loadConfig(path: string): ProxyConfig {
   const clientSigning = resolveClientSigningConfig(parsed?.clientSigning);
   const accountsCfg = resolveAccountsConfig(parsed?.accounts);
   const notificationsCfg = resolveNotificationsConfig(parsed?.notifications);
+  const panelCfg = resolvePanelConfig(parsed?.panel);
 
   const config: ProxyConfig = {
     server: { port, host },
@@ -199,6 +205,7 @@ export function loadConfig(path: string): ProxyConfig {
     claim: claimCfg,
     accounts: accountsCfg,
     notifications: notificationsCfg,
+    panel: panelCfg,
     logging: { level: logLevel },
   };
 
@@ -554,6 +561,36 @@ function validateSinkUrl(raw: string, name: string): string {
     throw new Error(`${name} must not contain a fragment`);
   }
   return raw;
+}
+
+/**
+ * Resolve the web panel (`panel:`) section. Env vars (the panel module's own
+ * names) win over YAML — the documented per-session override stays available;
+ * a YAML `token` makes enabling a one-time config instead of env setup.
+ * Token presence is NOT validated here beyond type: the refuse-to-start
+ * contract lives in resolvePanelSettings, which handles BOTH modes with one
+ * loud message.
+ */
+function resolvePanelConfig(raw: unknown): PanelConfig {
+  const obj = raw && typeof raw === "object" ? raw as Record<string, unknown> : {};
+  const enabledEnv = process.env[ENV.PANEL_ENABLED];
+  const tokenEnv = process.env[ENV.PANEL_TOKEN];
+  const portEnv = process.env[ENV.PANEL_PORT];
+  const token = typeof (tokenEnv ?? obj.token) === "string" ? String(tokenEnv ?? obj.token).trim() : undefined;
+  const portRaw = portEnv ?? obj.port;
+  return {
+    enabled: enabledEnv !== undefined ? resolveBool(enabledEnv, DEFAULTS.PANEL_ENABLED) : resolveBool(obj.enabled, DEFAULTS.PANEL_ENABLED),
+    ...(token ? { token } : {}),
+    ...(portRaw !== undefined && portRaw !== null
+      ? { port: (() => {
+          const n = typeof portRaw === "number" ? portRaw : parseInt(String(portRaw), 10);
+          if (!Number.isInteger(n) || n < 1 || n > 65535) {
+            throw new Error("panel.port must be an integer between 1 and 65535");
+          }
+          return n;
+        })() }
+      : {}),
+  };
 }
 
 function resolveNotificationsConfig(raw: unknown): NotificationsConfig {

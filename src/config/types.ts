@@ -244,6 +244,20 @@ export interface NotificationsConfig {
   cooldownSec?: number;
 }
 
+/**
+ * Web panel (`panel:` section) — the loopback dashboard at :8090. The
+ * security contract is unchanged in every mode: the panel binds 127.0.0.1
+ * only and REFUSES to start without a non-empty token.
+ */
+export interface PanelConfig {
+  /** Start the panel. Default `false`. */
+  enabled: boolean;
+  /** Shared secret for /api/* — REQUIRED when enabled. */
+  token?: string;
+  /** Loopback listen port. Default `8090`. */
+  port?: number;
+}
+
 /** Preference order used when the config carries none (today's behavior). */
 export const DEFAULT_PLAN_PRIORITY: PlanTier[] = ["start-plan", "coding-plan"];
 
@@ -349,6 +363,10 @@ export interface ProxyConfig {
    * omit it (no sinks configured — notifications off).
    */
   notifications?: NotificationsConfig;
+  /**
+   * Web panel. `loadConfig` always sets it; fixtures may omit it (panel off).
+   */
+  panel?: PanelConfig;
   logging: {
     level: "debug" | "info" | "warn" | "error";
   };

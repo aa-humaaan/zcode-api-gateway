@@ -88,6 +88,13 @@ planAutoSwitch: false
 #   ntfy: ""               # e.g. https://ntfy.sh/your-private-topic (phone push)
 #   cooldownSec: 300       # min seconds between repeats of the same event
 
+# Web panel — the loopback dashboard (TUI and serve modes alike). Set a token
+# here once instead of the ZCODE_PANEL_* env vars. Env vars still win when set.
+# panel:
+#   enabled: true
+#   token: "pick-a-long-secret"   # required; the panel refuses to start without one
+#   port: 8090                    # loopback (127.0.0.1) only
+
 providers:
   zai:
     anthropicBase: "https://api.z.ai/api/anthropic"

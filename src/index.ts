@@ -33,7 +33,7 @@ import {
 } from "./server/panel.js";
 import { checkForUpdate } from "./update/check.js";
 import { formatDuration } from "./plan/auto.js";
-import { LogBuffer, createControlDispatcher, type ControlState } from "./control.js";
+import { LogBuffer, createControlDispatcher, type ControlState, type LifecycleResult, type ConfigUpdateResult } from "./control.js";
 import { readFileSync, existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
@@ -205,8 +205,19 @@ function installLogTee(): LogBuffer {
   return buffer;
 }
 
+/** Lifecycle hooks the TUI passes so panel commands drive the TUI's own
+ * functions (single source of truth — a stop from the phone flips the
+ * desktop card, and vice versa). Serve mode omits them and gets the built-ins. */
+export interface PanelLifecycleHooks {
+  startProxy?: () => Promise<LifecycleResult>;
+  stopProxy?: () => Promise<{ ok: true } | { ok: false; error: string }>;
+  setConfig?: (changes: { provider?: ProviderId; plan?: "coding-plan" | "start-plan" }) => Promise<ConfigUpdateResult>;
+  /** Runs after every successful command (TUI: re-sync state and re-render). */
+  afterCommand?: () => Promise<void> | void;
+}
+
 /**
- * Start the optional web panel for `serve`. `serve` has no TUI, so this is the
+ * The optional web panel for `serve`. `serve` has no TUI, so this is the
  * only way to see quota, read live logs or switch provider/plan on a headless
  * box without `docker exec`.
  *
@@ -223,8 +234,11 @@ function installLogTee(): LogBuffer {
  * `shutdown` command unwinds the whole process (through the same path as the
  * signals, so it works after the proxy was stopped from the page), and a
  * logout/login re-syncs the live credential — see `handleControl` below.
+ *
+ * PLAN §8.3: when `hooks` is provided (TUI mode), the lifecycle commands
+ * delegate to the host instead of the built-in closures.
  */
-async function startServePanel(
+export async function startServePanel(
   settings: PanelSettings,
   ctx: {
     config: ProxyConfig;
@@ -236,9 +250,11 @@ async function startServePanel(
     fleet: FleetRouter | null;
     /** Unwind the process; independent of whether the proxy is still running. */
     shutdown: () => void;
+    /** Host lifecycle overrides (TUI mode); omitted = serve built-ins. */
+    hooks?: PanelLifecycleHooks;
   },
 ): Promise<PanelServer> {
-  const { config, path, auth, serverRef, logBuffer, shutdown, fleet } = ctx;
+  const { config, path, auth, serverRef, logBuffer, shutdown, fleet, hooks } = ctx;
 
   // The panel can log out (or log in another account) while `serve` keeps
   // running, but AuthManager caches the credential in memory and auto-claim
@@ -262,10 +278,18 @@ async function startServePanel(
     }
   }
 
+  // proxyPort reads live from serverRef (getter/setter object literal): in
+  // TUI mode the keyboard AND the panel both drive the lifecycle, so the
+  // dispatcher's own writes are absorbed — serverRef is the single truth.
   const controlState: ControlState = {
     provider: config.provider,
     plan: config.plan,
-    proxyPort: serverRef.current?.port ?? 0,
+    get proxyPort() {
+      return serverRef.current?.port ?? 0;
+    },
+    set proxyPort(value: number) {
+      void value; // serverRef already reflects the change
+    },
   };
 
   async function startProxy(): Promise<{ ok: true; port: number } | { ok: false; error: string }> {
@@ -319,9 +343,9 @@ async function startServePanel(
   // thing to clean up when the panel fails to start (P2, now structurally gone).
   const dispatchControl = createControlDispatcher(controlState, {
     logBuffer,
-    onStartProxy: startProxy,
-    onStopProxy: stopProxy,
-    onSetConfig: setConfig,
+    onStartProxy: hooks?.startProxy ?? startProxy,
+    onStopProxy: hooks?.stopProxy ?? stopProxy,
+    onSetConfig: hooks?.setConfig ?? setConfig,
     onQuota: () => collectQuotaSnapshot(config),
     onAccounts: async () => {
       // Pure snapshot, but re-sync from the store first so a panel login that
@@ -369,10 +393,12 @@ async function startServePanel(
     if (!res.ok) return res;
     await syncAuthWithDisk();
     if (cmd.cmd === "logout" && serverRef.current) {
-      await stopProxy();
+      const stop = hooks?.stopProxy ?? (async () => stopProxy());
+      await stop();
       controlState.proxyPort = 0;
       console.log("panel: logout cleared the live credential — proxy stopped");
     }
+    await hooks?.afterCommand?.();
     return res;
   };
 
@@ -576,7 +602,7 @@ async function serve(configPath: string | undefined, debug: boolean): Promise<vo
 
   // Optional web panel (issue #58). Resolved early so console output from the
   // startup path below is already captured for the panel's Logs card.
-  const panelSettings = resolvePanelSettings();
+  const panelSettings = resolvePanelSettings(process.env, config.panel);
   const panelLogBuffer = panelSettings ? installLogTee() : null;
 
   const auth = new AuthManager();

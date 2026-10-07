@@ -48,8 +48,12 @@
 > 1195 tests pass, typecheck clean; responses-hook + webhook verified live.
 > **Phase 1–3 of the plan are now fully built.**
 >
-> **NEXT UP (2026-10-07): §8 — Panel alongside the TUI.** Milestone committed
-> and pushed to the fork (d1cd9e6, upstream remote added).
+> **§8 Panel-alongside-the-TUI LANDED (2026-10-07)** — `panel:` config section
+> (env still wins; refuse-without-token unchanged), TUI starts the panel with
+> lifecycle hooks delegating to the TUI's own start/stop/setConfig (phone and
+> desktop are one source of truth), live proxyPort via serverRef getter,
+> log tee into the panel buffer, panel closed on quit. 1207 tests green;
+> config-only panel boot verified live. Milestone pushed: d1cd9e6 + fe14a37.
 > **§7 Usage Dashboard LANDED (2026-10-07)** — control command `{"cmd":"usage","days"}`
 > (clamped 1-365), ledger read-cache (stat-based, append-invalidated), panel
 > **Usage card** (window switcher 1d/7d/30d persisted, by-day bars, 2×2
@@ -398,7 +402,7 @@ auth surface — strictly additive to the panel and the control protocol.
 
 ## 8. Feature plan — Panel alongside the TUI (+ `panel:` in config.yaml)
 
-> Status: PLANNED (2026-10-07) — the next build after the §7 dashboard.
+> Status: **LANDED (2026-10-07)** — both parts shipped; TUI wiring needs the operator's manual exit test (TTY).
 > Motivation (live, 2026-10-07): the operator launched the TUI, opened
 > `127.0.0.1:8090` on a phone and got ERR_CONNECTION_REFUSED — the panel is
 > serve-mode-only today, so the dashboard requires giving up the TUI.

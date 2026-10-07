@@ -22,7 +22,9 @@ import { KeyResolver } from "../auth/resolver.js";
 import { openBrowser } from "../runtime/open-browser.js";
 import { pasteLoginInstructions, readPastedLine, boldIfTTY } from "../runtime/paste-login.js";
 import { isGuestOriginError, describeGuestError } from "../runtime/guest-error.js";
-import { ensureDeviceMidInConfig, VERSION, createServeJobs, type ServeArgs } from "../index.js";
+import { ensureDeviceMidInConfig, VERSION, createServeJobs, startServePanel, type ServeArgs } from "../index.js";
+import { resolvePanelSettings, type PanelServer } from "../server/panel.js";
+import { LogBuffer } from "../control.js";
 import { watchConfigFile, type ConfigWatcher } from "../config/watch.js";
 import { collectQuotaSnapshot, type QuotaSnapshot } from "../server/routes-quota.js";
 import { activePlan } from "../plan/auto.js";
@@ -70,6 +72,13 @@ export async function runTui(args: ServeArgs): Promise<void> {
   const auth = new AuthManager();
   const pane = new LogPane(2000);
   const serverRef: { current: ProxyServer | null } = { current: null };
+
+  // PLAN §8: optional web panel alongside the TUI (the phone dashboard).
+  // Resolved before the console interception so emit() can tee into the
+  // panel's log buffer from the very first line.
+  const panelSettings = resolvePanelSettings(process.env, config.panel);
+  const panelLogBuffer = panelSettings ? new LogBuffer() : null;
+  let panelRuntime: PanelServer | null = null;
 
   const state = {
     provider: config.provider as ProviderId,
@@ -121,6 +130,7 @@ export async function runTui(args: ServeArgs): Promise<void> {
   const logFile = process.env.ZCODE_TUI_LOGFILE;
   const emit = (text: string, level: "info" | "warn" | "error"): void => {
     pane.push(text, level);
+    panelLogBuffer?.push(text);
     if (logFile) {
       try { appendFileSync(logFile, text + "\n", "utf-8"); } catch { /* best-effort tee */ }
     }
@@ -711,6 +721,7 @@ export async function runTui(args: ServeArgs): Promise<void> {
     restoreStdio();
     try { configWatcher?.stop(); } catch { /* watcher not started */ }
     try { serverRef.current?.stop(false); } catch { /* already closed */ }
+    try { void panelRuntime?.close(); } catch { /* panel not started */ }
   }
   // Render watchdog: if the 33ms render chain ever dies (stuck timer id,
   // swallowed exception in a runtime with different uncaught semantics), the
@@ -759,5 +770,49 @@ export async function runTui(args: ServeArgs): Promise<void> {
     setToast("not logged in — press l to login", "err");
   } else {
     await startProxy();
+  }
+
+  // PLAN §8.3: start the web panel AFTER the boot start/stop so it reflects
+  // the initial proxy state. A failed panel start must never take the TUI
+  // down (same rule as serve). Lifecycle commands delegate to the TUI's own
+  // functions — desktop card and phone dashboard are one source of truth.
+  if (panelSettings && panelLogBuffer) {
+    try {
+      panelRuntime = await startServePanel(panelSettings, {
+        config,
+        path,
+        auth,
+        serverRef,
+        logBuffer: panelLogBuffer,
+        fleet: currentFleet(),
+        shutdown: quit,
+        hooks: {
+          startProxy: async () => {
+            await startProxy();
+            return serverRef.current
+              ? { ok: true, port: serverRef.current.port }
+              : { ok: false, error: state.serverError || "start_failed" };
+          },
+          stopProxy: async () => {
+            stopProxy();
+            return { ok: true };
+          },
+          setConfig: async (changes) => {
+            // Same stop-first rule as the serve panel; the TUI's own apply
+            // path keeps config.yaml + TUI state in sync.
+            if (state.serverStatus === "running" || state.serverStatus === "starting") {
+              return { ok: false, error: "stop_proxy_first" };
+            }
+            if (changes.provider) applyConfigChange(changes.provider, state.plan, `provider → ${changes.provider}`);
+            if (changes.plan) applyConfigChange(state.provider, changes.plan, `plan → ${changes.plan}`);
+            return { ok: true, provider: state.provider, plan: state.plan };
+          },
+          afterCommand: () => refreshAuth(),
+        },
+      });
+      console.log(`panel: http://${panelRuntime.hostname}:${panelRuntime.port} (token required)`);
+    } catch (err) {
+      console.error(`[panel] failed to start: ${(err as Error).message}`);
+    }
   }
 }

@@ -90,21 +90,34 @@ export function isPanelEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
 }
 
 /**
- * Resolve the panel configuration from the environment. Returns `null` when the
- * panel must not start — either it was not requested, or it was requested
- * without a token, which is a configuration mistake worth a loud message rather
- * than an unauthenticated listener.
+ * Resolve the panel configuration. Returns `null` when the panel must not
+ * start — either it was not requested, or it was requested without a token,
+ * which is a configuration mistake worth a loud message rather than an
+ * unauthenticated listener.
+ *
+ * Sources, in order: environment variables (per-session override, the
+ * original mechanism) → the `panel:` YAML config section (the one-time
+ * setup, PLAN §8.2) → defaults. The refuse-without-token contract applies
+ * identically whichever source enabled the panel.
  */
-export function resolvePanelSettings(env: NodeJS.ProcessEnv = process.env): PanelSettings | null {
-  if (!isPanelEnabled(env)) return null;
+export function resolvePanelSettings(
+  env: NodeJS.ProcessEnv = process.env,
+  yaml?: { enabled?: boolean; token?: string; port?: number },
+): PanelSettings | null {
+  // Precedence by PRESENCE: an env var that is set wins (even an explicit
+  // "0" disables); an unset env var defers to YAML; neither → off.
+  const rawEnabled = env[PANEL_ENABLED_ENV];
+  const enabled = rawEnabled !== undefined ? isPanelEnabled(env) : yaml?.enabled === true;
+  if (!enabled) return null;
 
-  const token = (env[PANEL_TOKEN_ENV] ?? "").trim();
+  const token = (env[PANEL_TOKEN_ENV] ?? yaml?.token ?? "").trim();
   if (!token) {
-    console.error(`[panel] ${PANEL_ENABLED_ENV} is set but ${PANEL_TOKEN_ENV} is empty — panel not started`);
+    console.error(`[panel] the panel is enabled but no token was set (${PANEL_TOKEN_ENV} or panel.token in config.yaml) — panel not started`);
     return null;
   }
 
-  const port = Number(env[PANEL_PORT_ENV] ?? DEFAULT_PANEL_PORT) || DEFAULT_PANEL_PORT;
+  const rawPort = env[PANEL_PORT_ENV] ?? yaml?.port ?? DEFAULT_PANEL_PORT;
+  const port = Number(rawPort) || DEFAULT_PANEL_PORT;
   return { token, port };
 }
 
